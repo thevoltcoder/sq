@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 cpal = "0.18.2"
-ctrlc = "3.5.2"
 fundsp = "0.23.0"
 rubato = "5.1.0"
 symphonia = { version = "0.6.1", features = ["all"] }

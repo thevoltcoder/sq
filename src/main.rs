@@ -1,8 +1,11 @@
 use std::time::Duration;
 
 fn main() {
-    let mut args = sq::sys::Args {
-        file: Some("/Users/tomasmiglio/Documents/bonelesswing.mp3".to_string()),
+    let args = sq::sys::Args {
+        file: Some(cfg_select! {
+            windows => "C:/Users/tomas/Documents/bonelesswing.mp3".to_string(),
+            unix => "~/Documents/bonelesswing.mp3".to_string(),
+        }),
         ..Default::default()
     };
     for warn in sq::sys::warn_extreme_settings(&args) {
@@ -15,7 +18,7 @@ fn main() {
         }
     });
     std::thread::sleep(Duration::from_secs(5));
-    args.fade_to(0.5, 1.0);
+    args.fade_to(0.0, Duration::from_secs(0));
     std::thread::sleep(Duration::from_secs(1));
     args.stop();
     std::thread::sleep(Duration::from_secs(1));

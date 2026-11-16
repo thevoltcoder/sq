@@ -21,7 +21,6 @@ use symphonia::core::{
     meta::MetadataOptions,
 };
 
-const FADE_SECS: f32 = 0.05;
 const LOOKAHEAD_SECS: f32 = 0.005;
 const RELEASE_SECS: f32 = 0.1;
 const WINDOW_DIV: usize = 20;
@@ -73,9 +72,9 @@ impl Args {
         self.set_volume(10f32.powf(db / 20.0));
     }
 
-    pub fn fade_to(&self, target: f32, secs: f32) {
+    pub fn fade_to(&self, target: f32, dur: Duration) {
         let start = f32::from_bits(self.volume.load(Ordering::Relaxed));
-        let steps = (secs * 100.0).max(1.0) as u32;
+        let steps = (dur.as_secs_f32() * 100.0).max(1.0) as u32;
         for i in 1..=steps {
             let t = i as f32 / steps as f32;
             self.set_volume(start + (target - start) * t);
@@ -83,7 +82,7 @@ impl Args {
         }
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop(&self) {
         self.stop_queued.store(true, Ordering::Relaxed);
     }
 }
@@ -409,7 +408,6 @@ struct Pipeline {
     limiter: Limiter,
     ceiling: f32,
     strikes: u32,
-    fade_frames: usize,
     tx: SyncSender<Vec<f32>>,
 }
 
@@ -430,7 +428,6 @@ impl Pipeline {
             limiter: Limiter::new(rate, channels, ceiling),
             ceiling,
             strikes: 0,
-            fade_frames: std::cmp::Ord::max((rate as f32 * FADE_SECS) as usize, 1),
             tx,
         })
     }
@@ -485,18 +482,6 @@ impl Pipeline {
             *s = s.clamp(-self.ceiling, self.ceiling);
         }
 
-        if last {
-            let frames = chunk.len() / self.channels;
-            let fade = std::cmp::Ord::min(self.fade_frames, frames);
-            for i in 0..fade {
-                let g = (fade - 1 - i) as f32 / fade as f32;
-                let frame = frames - fade + i;
-                for c in 0..self.channels {
-                    chunk[frame * self.channels + c] *= g;
-                }
-            }
-        }
-
         if chunk.is_empty() {
             return Ok(true);
         }
@@ -507,7 +492,7 @@ impl Pipeline {
 fn decode_thread(
     args: Args,
     shared: Arc<Shared>,
-    spec_tx: mpsc::Sender<(u32, u16, Option<u64>)>,
+    spec_tx: mpsc::Sender<(u32, u16)>,
     rate_rx: Receiver<u32>,
     tx: SyncSender<Vec<f32>>,
 ) -> anyhow::Result<()> {
@@ -527,7 +512,6 @@ fn decode_thread(
     let track = format
         .default_track(TrackType::Audio)
         .context("no audio track")?;
-    let total_frames = track.num_frames;
     let mut decoder = symphonia::default::get_codecs().make_audio_decoder(
         track
             .codec_params
@@ -551,9 +535,7 @@ fn decode_thread(
             let file_rate = decoded.spec().rate();
             let channels = decoded.spec().channels().count();
             check_channels(channels)?;
-            spec_tx
-                .send((file_rate, channels as u16, total_frames))
-                .ok();
+            spec_tx.send((file_rate, channels as u16)).ok();
             let out_rate = rate_rx.recv().context("output device setup failed")?;
             if out_rate != file_rate {
                 resampler = Some(ResampleStage::new(file_rate, out_rate, channels)?);
@@ -631,11 +613,8 @@ struct Player {
     volume: Arc<AtomicU32>,
     channels: usize,
     ceiling: f32,
-    step: f32,
-    gain: f32,
     cur: Vec<f32>,
     pos: usize,
-    last_frame: Vec<f32>,
 }
 
 impl Player {
@@ -644,21 +623,16 @@ impl Player {
         shared: Arc<Shared>,
         volume: Arc<AtomicU32>,
         channels: usize,
-        rate: u32,
         ceiling: f32,
     ) -> Self {
-        let channels = std::cmp::Ord::max(channels, 1);
         Self {
             rx,
             shared,
             volume,
-            channels,
+            channels: std::cmp::Ord::max(channels, 1),
             ceiling,
-            step: 1.0 / (rate as f32 * FADE_SECS),
-            gain: 0.0,
             cur: Vec::new(),
             pos: 0,
-            last_frame: vec![0.0; channels],
         }
     }
 
@@ -690,28 +664,21 @@ impl Player {
             let have_frame = !stopping && self.pos + frame.len() <= self.cur.len();
 
             if have_frame {
-                self.gain = (self.gain + self.step).min(1.0);
-                for (channel, sample) in frame.iter_mut().enumerate() {
+                for sample in frame.iter_mut() {
                     let value = self.cur[self.pos];
                     self.pos += 1;
-                    let output = if value.is_finite() {
-                        (value * self.gain * vol).clamp(-ceiling, ceiling)
+                    *sample = if value.is_finite() {
+                        (value * vol).clamp(-ceiling, ceiling)
                     } else {
                         0.0
                     };
-                    *sample = output;
-                    self.last_frame[channel] = output;
                 }
                 emitted += frame.len();
             } else {
                 if !stopping && self.pos < self.cur.len() {
                     self.pos = self.cur.len();
                 }
-                self.gain = (self.gain - self.step).max(0.0);
-                for (channel, sample) in frame.iter_mut().enumerate() {
-                    *sample = (self.last_frame[channel] * self.gain).clamp(-ceiling, ceiling);
-                    self.last_frame[channel] = *sample;
-                }
+                frame.fill(0.0);
             }
         }
         self.shared.played.fetch_add(emitted, Ordering::Relaxed);
@@ -732,7 +699,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     let handle =
         std::thread::spawn(move || decode_thread(thread_args, thread_shared, spec_tx, rate_rx, tx));
 
-    let (file_rate, channels, total_frames) = match spec_rx.recv() {
+    let (file_rate, channels) = match spec_rx.recv() {
         Ok(spec) => spec,
         Err(_) => {
             handle
@@ -746,16 +713,12 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     let rate = config.sample_rate;
     rate_tx.send(rate).ok();
 
-    let samples_per_sec = rate as f64 * channels as f64;
-    let total_secs = total_frames.map(|f| f as f64 / file_rate as f64);
-
     let err_shared = Arc::clone(&shared);
     let mut player = Player::new(
         rx,
         Arc::clone(&shared),
         Arc::clone(&args.volume),
         channels as usize,
-        rate,
         ceiling,
     );
 
@@ -791,12 +754,10 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         }
 
         if shared.stop.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs_f32(FADE_SECS) + Duration::from_millis(50));
             drop(stream);
             if let Some(h) = handle.take() {
                 let _ = h.join();
             }
-            println!();
             return Ok(());
         }
 
@@ -814,12 +775,6 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
                     bail!("decoder thread panicked");
                 }
             }
-        }
-
-        let cur_secs = shared.played.load(Ordering::Relaxed) as f64 / samples_per_sec;
-        match total_secs {
-            Some(t) => print!("\r{:.0}/{:.0}", cur_secs.min(t), t),
-            None => print!("\r{cur_secs:.0}s"),
         }
         std::io::stdout().flush().ok();
 
