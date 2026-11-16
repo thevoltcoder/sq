@@ -18,7 +18,7 @@ fn main() {
         }
     });
     std::thread::sleep(Duration::from_secs(5));
-    args.fade_to(0.0, Duration::from_secs(0));
+    args.fade_to(0.5, Duration::from_secs(1));
     std::thread::sleep(Duration::from_secs(1));
     args.stop();
     std::thread::sleep(Duration::from_secs(1));
