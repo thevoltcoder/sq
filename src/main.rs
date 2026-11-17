@@ -257,7 +257,7 @@ slint::slint! {
                         alignment: LayoutAlignment.start;
                         Param { idx: 0; label: "Preamp"; lo: -24; hi: 24; initial: 0; unit: " dB"; }
                         Param { idx: 1; label: "High-pass"; lo: 20; hi: 2000; initial: 80; unit: " Hz"; }
-                        Param { idx: 2; label: "Low-pass"; lo: 1000; hi: 18000; initial: 16000; unit: " Hz"; }
+                        Param { idx: 2; label: "Low-pass"; lo: 20; hi: 18000; initial: 16000; unit: " Hz"; }
                         Param { idx: 3; label: "Ceiling"; lo: -36; hi: -6; initial: -12; unit: " dBFS"; optional: false; }
                     }
                 }
@@ -301,18 +301,18 @@ slint::slint! {
                         padding: 16px;
                         spacing: 8px;
                         alignment: LayoutAlignment.start;
-                        Param { idx: 13; label: "Low shelf freq"; lo: 20; hi: 1000; initial: 100; unit: " Hz"; }
-                        Param { idx: 14; label: "Low shelf Q"; lo: 0.3; hi: 2; initial: 0.707; optional: false; }
-                        Param { idx: 15; label: "Low shelf gain"; lo: -12; hi: 12; initial: 0; unit: " dB"; optional: false; }
-                        Param { idx: 16; label: "Bell 1 freq"; lo: 100; hi: 10000; initial: 1000; unit: " Hz"; }
+                        Param { idx: 13; label: "Low shelf freq"; lo: 20; hi: 18000; initial: 100; unit: " Hz"; }
+                        Param { idx: 14; label: "Low shelf Q"; lo: 0.1; hi: 10; initial: 0.707; optional: false; }
+                        Param { idx: 15; label: "Low shelf gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
+                        Param { idx: 16; label: "Bell 1 freq"; lo: 20; hi: 18000; initial: 1000; unit: " Hz"; }
                         Param { idx: 17; label: "Bell 1 Q"; lo: 0.1; hi: 10; initial: 1; optional: false; }
-                        Param { idx: 18; label: "Bell 1 gain"; lo: -12; hi: 12; initial: 0; unit: " dB"; optional: false; }
-                        Param { idx: 22; label: "Bell 2 freq"; lo: 100; hi: 10000; initial: 3000; unit: " Hz"; }
+                        Param { idx: 18; label: "Bell 1 gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
+                        Param { idx: 22; label: "Bell 2 freq"; lo: 20; hi: 18000; initial: 3000; unit: " Hz"; }
                         Param { idx: 23; label: "Bell 2 Q"; lo: 0.1; hi: 10; initial: 1; optional: false; }
-                        Param { idx: 24; label: "Bell 2 gain"; lo: -12; hi: 12; initial: 0; unit: " dB"; optional: false; }
-                        Param { idx: 19; label: "High shelf freq"; lo: 1000; hi: 18000; initial: 8000; unit: " Hz"; }
-                        Param { idx: 20; label: "High shelf Q"; lo: 0.3; hi: 2; initial: 0.707; optional: false; }
-                        Param { idx: 21; label: "High shelf gain"; lo: -12; hi: 12; initial: 0; unit: " dB"; optional: false; }
+                        Param { idx: 24; label: "Bell 2 gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
+                        Param { idx: 19; label: "High shelf freq"; lo: 20; hi: 18000; initial: 8000; unit: " Hz"; }
+                        Param { idx: 20; label: "High shelf Q"; lo: 0.1; hi: 10; initial: 0.707; optional: false; }
+                        Param { idx: 21; label: "High shelf gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
                     }
                 }
             }

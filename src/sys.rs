@@ -24,9 +24,7 @@ use symphonia::core::{
 const LOOKAHEAD_SECS: f32 = 0.005;
 const RELEASE_SECS: f32 = 0.1;
 const WINDOW_DIV: usize = 100;
-const STRIKE_LIMIT: u32 = 4;
 
-const PEAK_ABORT: f32 = 4.0;
 const DC_BLOCK_HZ: f32 = 20.0;
 const QUEUE_DEPTH: usize = 4;
 
@@ -400,17 +398,6 @@ impl Limiter {
     }
 }
 
-fn mean_square(buf: &[f32]) -> f64 {
-    if buf.is_empty() {
-        return 0.0;
-    }
-    buf.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / buf.len() as f64
-}
-
-fn to_db(ms: f64) -> f64 {
-    10.0 * ms.max(1e-12).log10()
-}
-
 struct ResampleStage {
     inner: Fft<f32>,
     channels: usize,
@@ -459,7 +446,6 @@ struct Pipeline {
     chains: Vec<ChannelChain>,
     limiter: Limiter,
     ceiling: f32,
-    strikes: u32,
     tx: SyncSender<Vec<f32>>,
     live_filters: Arc<RwLock<FilterSettings>>,
     settings: FilterSettings,
@@ -487,7 +473,6 @@ impl Pipeline {
                 .collect(),
             limiter: Limiter::new(rate, channels, ceiling),
             ceiling,
-            strikes: 0,
             tx,
             live_filters,
             settings,
@@ -524,23 +509,13 @@ impl Pipeline {
                 }
             }
 
-            let in_ms = mean_square(&chunk);
             apply_filters(&mut chunk, self.channels, &mut self.chains);
 
-            if chunk.iter().any(|s| !s.is_finite() || s.abs() > PEAK_ABORT) {
-                bail!("filter output blew up (non-finite or peak above {PEAK_ABORT}), aborting");
+            if chunk.iter().any(|s| !s.is_finite()) {
+                bail!("filter output became non-finite, aborting");
             }
 
-            let out_ms = mean_square(&chunk);
-            let hot = out_ms > 1.0 || (out_ms > 0.25 && out_ms > in_ms * 16.0);
-            self.strikes = if hot { self.strikes + 1 } else { 0 };
-            if self.strikes >= STRIKE_LIMIT {
-                bail!(
-                    "output too loud: {:.1} dBFS RMS vs {:.1} dBFS input, aborting",
-                    to_db(out_ms),
-                    to_db(in_ms)
-                );
-            }
+            self.limiter.process(&mut chunk);
 
             for s in chunk.iter_mut() {
                 if !s.is_finite() {
