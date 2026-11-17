@@ -1,11 +1,12 @@
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
-use sq::sys;
+use sq::{
+    filters::Filters,
+    sys::{Args, run, warn_extreme_settings},
+};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-
-mod filters;
 
 slint::slint! {
     #[edition = "1.19"]
@@ -321,8 +322,8 @@ slint::slint! {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
-    let params = Arc::new(Mutex::new(filters::Filters::default()));
-    let session: Arc<Mutex<Option<sys::Args>>> = Arc::new(Mutex::new(None));
+    let params = Arc::new(Mutex::new(Filters::default()));
+    let session: Arc<Mutex<Option<Args>>> = Arc::new(Mutex::new(None));
 
     let main_ui = MainWindow::new()?;
     let filter_ui = FilterWindow::new()?;
@@ -333,19 +334,18 @@ fn main() -> Result<(), slint::PlatformError> {
         move |idx, on, val| {
             let updated = if let Ok(mut p) = params.lock() {
                 p.set(idx as usize, on, val);
-                let mut args = sys::Args::default();
+                let mut args = Args::default();
                 p.apply(&mut args);
                 Some(args)
             } else {
                 None
             };
 
-            if let Some(updated) = updated {
-                if let Ok(slot) = session.lock() {
-                    if let Some(args) = slot.as_ref() {
-                        args.update_filters(&updated);
-                    }
-                }
+            if let Some(updated) = updated
+                && let Ok(slot) = session.lock()
+                && let Some(args) = slot.as_ref()
+            {
+                args.update_filters(&updated);
             }
         }
     });
@@ -353,12 +353,13 @@ fn main() -> Result<(), slint::PlatformError> {
     main_ui.on_gain_changed({
         let session = session.clone();
         move |gain| {
-            if let Ok(slot) = session.lock() {
-                if let Some(args) = slot.as_ref() {
-                    let mut updated = sys::Args::default();
-                    updated.postamp = Some(gain);
-                    args.update_filters(&updated);
-                }
+            if let Ok(slot) = session.lock()
+                && let Some(args) = slot.as_ref()
+            {
+                args.update_filters(&Args {
+                    postamp: Some(gain),
+                    ..Default::default()
+                });
             }
         }
     });
@@ -375,7 +376,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 old.stop();
             }
 
-            let mut args = sys::Args {
+            let mut args = Args {
                 file: Some(path.to_string()),
                 ..Default::default()
             };
@@ -391,7 +392,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_error("".into());
                 });
-                if let Err(e) = sys::run(&thread_args) {
+                if let Err(e) = run(&thread_args) {
                     let msg = format!("ERROR: {e:#}");
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         ui.set_error(msg.into());
@@ -454,12 +455,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             };
 
-            let mut args = sys::Args::default();
+            let mut args = Args::default();
             if let Ok(p) = params.lock() {
                 p.apply(&mut args);
             }
 
-            let list: Vec<SharedString> = sys::warn_extreme_settings(&args)
+            let list: Vec<SharedString> = warn_extreme_settings(&args)
                 .iter()
                 .map(|w| SharedString::from(w.to_string()))
                 .collect();
