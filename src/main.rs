@@ -26,7 +26,12 @@ slint::slint! {
         in property <bool> optional: true;
         property <bool> on: !root.optional;
         property <float> val: root.initial;
+        property <string> txt: "" + Math.round(root.initial * 100) / 100;
         spacing: 10px;
+
+        changed val => {
+            root.txt = "" + Math.round(root.val * 100) / 100;
+        }
 
         Text {
             text: root.label;
@@ -53,6 +58,18 @@ slint::slint! {
             }
         }
 
+        if root.unit != "" : LineEdit {
+            width: 80px;
+            enabled: root.on;
+            text <=> root.txt;
+            input-type: InputType.decimal;
+            accepted(t) => {
+                root.val = Math.clamp(t.to-float(), root.lo, root.hi);
+                root.txt = "" + Math.round(root.val * 100) / 100;
+                Bridge.edited(root.idx, root.on, root.val);
+            }
+        }
+
         Text {
             text: root.on ? "" + Math.round(root.val * 100) / 100 + root.unit : "off";
             width: 90px;
@@ -70,12 +87,24 @@ slint::slint! {
         callback end(float);
         callback show-filters();
         callback browse();
+        callback gain-changed(float);
 
         in-out property <string> path;
         property <float> gain: 0.0;
         property <float> fade: 2.0;
+        property <string> gain-txt: "0";
+        property <string> fade-txt: "2";
         in property <[string]> warnings;
         in property <string> error;
+
+        changed gain => {
+            root.gain-txt = "" + Math.round(root.gain);
+            root.gain-changed(root.gain);
+        }
+
+        changed fade => {
+            root.fade-txt = "" + Math.round(root.fade * 10) / 10;
+        }
 
         VerticalLayout {
             padding: 24px;
@@ -116,6 +145,15 @@ slint::slint! {
                         root.gain = g;
                     }
                 }
+                LineEdit {
+                    width: 60px;
+                    text <=> root.gain-txt;
+                    input-type: InputType.decimal;
+                    accepted(t) => {
+                        root.gain = Math.clamp(t.to-float(), -60, 60);
+                        root.gain-txt = "" + Math.round(root.gain);
+                    }
+                }
                 Text {
                     text: root.gain.round() + " dB";
                     width: 60px;
@@ -137,6 +175,15 @@ slint::slint! {
                     value: root.fade;
                     changed(v) => {
                         root.fade = v;
+                    }
+                }
+                LineEdit {
+                    width: 60px;
+                    text <=> root.fade-txt;
+                    input-type: InputType.decimal;
+                    accepted(t) => {
+                        root.fade = Math.clamp(t.to-float(), 0, 10);
+                        root.fade-txt = "" + Math.round(root.fade * 10) / 10;
                     }
                 }
                 Text {
@@ -225,8 +272,8 @@ slint::slint! {
                         alignment: LayoutAlignment.start;
                         Param { idx: 4; label: "Threshold"; lo: -80; hi: 0; initial: -40; unit: " dB"; }
                         Param { idx: 5; label: "Depth"; lo: -80; hi: 0; initial: -40; unit: " dB"; optional: false; }
-                        Param { idx: 6; label: "Attack"; lo: 1; hi: 100; initial: 5; unit: " ms"; optional: false; }
-                        Param { idx: 7; label: "Release"; lo: 10; hi: 1000; initial: 100; unit: " ms"; optional: false; }
+                        Param { idx: 6; label: "Attack"; lo: 0.01; hi: 200; initial: 1; unit: " ms"; optional: false; }
+                        Param { idx: 7; label: "Release"; lo: 0.01; hi: 1000; initial: 150; unit: " ms"; optional: false; }
                     }
                 }
             }
@@ -240,8 +287,8 @@ slint::slint! {
                         alignment: LayoutAlignment.start;
                         Param { idx: 8; label: "Threshold"; lo: -60; hi: 0; initial: -18; unit: " dB"; }
                         Param { idx: 9; label: "Ratio"; lo: 1; hi: 20; initial: 4; unit: " :1"; optional: false; }
-                        Param { idx: 10; label: "Attack"; lo: 1; hi: 200; initial: 10; unit: " ms"; optional: false; }
-                        Param { idx: 11; label: "Release"; lo: 10; hi: 1000; initial: 100; unit: " ms"; optional: false; }
+                        Param { idx: 10; label: "Attack"; lo: 0.01; hi: 200; initial: 1; unit: " ms"; optional: false; }
+                        Param { idx: 11; label: "Release"; lo: 0.01; hi: 1000; initial: 150; unit: " ms"; optional: false; }
                         Param { idx: 12; label: "Makeup"; lo: 0; hi: 12; initial: 0; unit: " dB"; optional: false; }
                     }
                 }
@@ -282,9 +329,36 @@ fn main() -> Result<(), slint::PlatformError> {
 
     filter_ui.global::<Bridge>().on_edited({
         let params = params.clone();
+        let session = session.clone();
         move |idx, on, val| {
-            if let Ok(mut p) = params.lock() {
+            let updated = if let Ok(mut p) = params.lock() {
                 p.set(idx as usize, on, val);
+                let mut args = sys::Args::default();
+                p.apply(&mut args);
+                Some(args)
+            } else {
+                None
+            };
+
+            if let Some(updated) = updated {
+                if let Ok(slot) = session.lock() {
+                    if let Some(args) = slot.as_ref() {
+                        args.update_filters(&updated);
+                    }
+                }
+            }
+        }
+    });
+
+    main_ui.on_gain_changed({
+        let session = session.clone();
+        move |gain| {
+            if let Ok(slot) = session.lock() {
+                if let Some(args) = slot.as_ref() {
+                    let mut updated = sys::Args::default();
+                    updated.postamp = Some(gain);
+                    args.update_filters(&updated);
+                }
             }
         }
     });
@@ -309,6 +383,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Ok(p) = params.lock() {
                 p.apply(&mut args);
             }
+            args.update_filters(&args);
 
             let thread_args = args.clone();
             let weak = weak.clone();

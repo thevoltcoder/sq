@@ -8,7 +8,7 @@ use rubato::{Fft, FixedSync, Resampler as _, audioadapter_buffers::direct::Inter
 use std::{
     io::Write,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
@@ -23,12 +23,12 @@ use symphonia::core::{
 
 const LOOKAHEAD_SECS: f32 = 0.005;
 const RELEASE_SECS: f32 = 0.1;
-const WINDOW_DIV: usize = 20;
+const WINDOW_DIV: usize = 100;
 const STRIKE_LIMIT: u32 = 4;
 
 const PEAK_ABORT: f32 = 4.0;
 const DC_BLOCK_HZ: f32 = 20.0;
-const QUEUE_DEPTH: usize = 32;
+const QUEUE_DEPTH: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct Args {
@@ -43,6 +43,8 @@ pub struct Args {
     pub ceiling: f32,
     pub volume: Arc<AtomicU32>,
     pub stop_queued: Arc<AtomicBool>,
+    pub live_filters: Arc<RwLock<FilterSettings>>,
+    pub live_ceiling: Arc<AtomicU32>,
 }
 
 impl Default for Args {
@@ -59,11 +61,32 @@ impl Default for Args {
             ceiling: -12.0,
             volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             stop_queued: Arc::new(AtomicBool::new(false)),
+            live_filters: Arc::new(RwLock::new(FilterSettings::default())),
+            live_ceiling: Arc::new(AtomicU32::new(10.0_f32.powf(-12.0 / 20.0).to_bits())),
         }
     }
 }
 
 impl Args {
+    pub fn update_filters(&self, source: &Args) {
+        if let Ok(mut settings) = self.live_filters.write() {
+            *settings = FilterSettings {
+                preamp: source.preamp,
+                postamp: source.postamp,
+                hpf: source.hpf,
+                lpf: source.lpf,
+                gate: source.gate,
+                eq: source.eq.clone(),
+                comp: source.comp,
+                ceiling: source.ceiling,
+            };
+            self.live_ceiling.store(
+                10.0_f32.powf(source.ceiling / 20.0).to_bits(),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     pub fn set_volume(&self, gain: f32) {
         self.volume.store(gain.to_bits(), Ordering::Relaxed);
     }
@@ -92,7 +115,7 @@ impl Args {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoiseGate {
     pub thresh: f32,
     pub depth: f32,
@@ -100,14 +123,14 @@ pub struct NoiseGate {
     pub rel: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EqKind {
     Bell,
     LowShelf,
     HighShelf,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EqBand {
     pub kind: EqKind,
     pub hz: f32,
@@ -115,7 +138,7 @@ pub struct EqBand {
     pub gain: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Compressor {
     pub thresh: f32,
     pub ratio: f32,
@@ -124,7 +147,34 @@ pub struct Compressor {
     pub makeup: f32,
 }
 
-fn check_nyquist(args: &Args, rate: u32) -> anyhow::Result<()> {
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterSettings {
+    preamp: Option<f32>,
+    postamp: Option<f32>,
+    hpf: Option<f32>,
+    lpf: Option<f32>,
+    gate: Option<NoiseGate>,
+    eq: Vec<EqBand>,
+    comp: Option<Compressor>,
+    ceiling: f32,
+}
+
+impl Default for FilterSettings {
+    fn default() -> Self {
+        Self {
+            preamp: None,
+            postamp: None,
+            hpf: None,
+            lpf: None,
+            gate: None,
+            eq: Vec::new(),
+            comp: None,
+            ceiling: -12.0,
+        }
+    }
+}
+
+fn check_nyquist(args: &FilterSettings, rate: u32) -> anyhow::Result<()> {
     let limit = rate as f32 * 0.45;
     let mut freqs: Vec<(&str, f32)> = Vec::new();
     if let Some(v) = args.hpf {
@@ -156,7 +206,7 @@ fn check_channels(channels: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_chain(args: &Args, rate: f64) -> Vec<Box<dyn AudioUnit>> {
+fn build_chain(args: &FilterSettings, rate: f64) -> Vec<Box<dyn AudioUnit>> {
     let mut chain: Vec<Box<dyn AudioUnit>> = Vec::new();
 
     chain.push(Box::new(highpass_hz(DC_BLOCK_HZ, 0.707)));
@@ -245,7 +295,7 @@ struct ChannelChain {
 }
 
 impl ChannelChain {
-    fn new(args: &Args, rate: f64) -> Self {
+    fn new(args: &FilterSettings, rate: f64) -> Self {
         Self {
             stages: build_chain(args, rate),
             a: BufferArray::<U1>::new(),
@@ -405,11 +455,14 @@ impl ResampleStage {
 
 struct Pipeline {
     channels: usize,
+    rate: u32,
     chains: Vec<ChannelChain>,
     limiter: Limiter,
     ceiling: f32,
     strikes: u32,
     tx: SyncSender<Vec<f32>>,
+    live_filters: Arc<RwLock<FilterSettings>>,
+    settings: FilterSettings,
 }
 
 impl Pipeline {
@@ -419,21 +472,48 @@ impl Pipeline {
         channels: usize,
         tx: SyncSender<Vec<f32>>,
     ) -> anyhow::Result<Self> {
-        check_nyquist(args, rate)?;
-        let ceiling = 10f32.powf(args.ceiling / 20.0);
+        let live_filters = Arc::clone(&args.live_filters);
+        let settings = live_filters
+            .read()
+            .map_err(|_| anyhow::anyhow!("live filter settings lock poisoned"))?
+            .clone();
+        check_nyquist(&settings, rate)?;
+        let ceiling = 10f32.powf(settings.ceiling / 20.0);
         Ok(Self {
             channels,
+            rate,
             chains: (0..channels)
-                .map(|_| ChannelChain::new(args, rate as f64))
+                .map(|_| ChannelChain::new(&settings, rate as f64))
                 .collect(),
             limiter: Limiter::new(rate, channels, ceiling),
             ceiling,
             strikes: 0,
             tx,
+            live_filters,
+            settings,
         })
     }
 
+    fn refresh_filters(&mut self) -> anyhow::Result<()> {
+        let settings = self
+            .live_filters
+            .read()
+            .map_err(|_| anyhow::anyhow!("live filter settings lock poisoned"))?
+            .clone();
+        if settings != self.settings {
+            check_nyquist(&settings, self.rate)?;
+            self.ceiling = 10f32.powf(settings.ceiling / 20.0);
+            self.limiter.ceiling = self.ceiling;
+            self.chains = (0..self.channels)
+                .map(|_| ChannelChain::new(&settings, self.rate as f64))
+                .collect();
+            self.settings = settings;
+        }
+        Ok(())
+    }
+
     fn push(&mut self, mut chunk: Vec<f32>, last: bool) -> anyhow::Result<bool> {
+        self.refresh_filters()?;
         let usable = chunk.len() / self.channels * self.channels;
         chunk.truncate(usable);
 
@@ -612,9 +692,9 @@ struct Player {
     rx: Receiver<Vec<f32>>,
     shared: Arc<Shared>,
     volume: Arc<AtomicU32>,
+    ceiling: Arc<AtomicU32>,
     last_vol: f32,
     channels: usize,
-    ceiling: f32,
     cur: Vec<f32>,
     pos: usize,
 }
@@ -624,24 +704,24 @@ impl Player {
         rx: Receiver<Vec<f32>>,
         shared: Arc<Shared>,
         volume: Arc<AtomicU32>,
+        ceiling: Arc<AtomicU32>,
         channels: usize,
-        ceiling: f32,
     ) -> Self {
         let last_vol = f32::from_bits(volume.load(Ordering::Relaxed));
         Self {
             rx,
             shared,
             volume,
+            ceiling,
             last_vol,
             channels: std::cmp::Ord::max(channels, 1),
-            ceiling,
             cur: Vec::new(),
             pos: 0,
         }
     }
 
     fn fill(&mut self, data: &mut [f32]) {
-        let ceiling = self.ceiling;
+        let ceiling = f32::from_bits(self.ceiling.load(Ordering::Relaxed));
         let target = f32::from_bits(self.volume.load(Ordering::Relaxed));
         let start = self.last_vol;
         let total_frames = std::cmp::Ord::max(data.len() / self.channels, 1);
@@ -698,7 +778,6 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     let device = cpal::default_host()
         .default_output_device()
         .context("no default output device")?;
-    let ceiling = 10.0_f32.powf(args.ceiling / 20.0);
     let (spec_tx, spec_rx) = mpsc::channel();
     let (rate_tx, rate_rx) = mpsc::channel::<u32>();
     let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(QUEUE_DEPTH);
@@ -727,8 +806,8 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         rx,
         Arc::clone(&shared),
         Arc::clone(&args.volume),
+        Arc::clone(&args.live_ceiling),
         channels as usize,
-        ceiling,
     );
 
     let stream = device
