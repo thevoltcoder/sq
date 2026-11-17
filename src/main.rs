@@ -79,7 +79,7 @@ slint::slint! {
     }
 
     export component MainWindow inherits Window {
-        title: "Audio Fade";
+        title: "SQ";
         min-width: 440px;
         min-height: 260px;
 
@@ -243,7 +243,7 @@ slint::slint! {
     }
 
     export component FilterWindow inherits Window {
-        title: "Audio Filters";
+        title: "Filter Settings";
         min-width: 600px;
         min-height: 400px;
 
