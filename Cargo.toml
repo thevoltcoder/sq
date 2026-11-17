@@ -14,5 +14,7 @@ strip = "symbols"
 anyhow = "1.0.104"
 cpal = "0.18.2"
 fundsp = "0.23.0"
+rfd = "0.18.0"
 rubato = "5.1.0"
+slint = "1.19.0"
 symphonia = { version = "0.6.1", features = ["all"] }

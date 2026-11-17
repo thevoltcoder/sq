@@ -73,22 +73,23 @@ impl Args {
     }
 
     pub fn fade_to(&self, target: f32, dur: Duration) {
+        const FLOOR: f32 = 1e-4;
         let start = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        let start_db = 20.0 * start.max(FLOOR).log10();
+        let target_db = 20.0 * target.max(FLOOR).log10();
         let steps = (dur.as_secs_f32() * 100.0).max(1.0) as u32;
         for i in 1..=steps {
             let t = i as f32 / steps as f32;
-            self.set_volume(start + (target - start) * t);
+            let db = start_db + (target_db - start_db) * t;
+            self.set_volume(10f32.powf(db / 20.0));
             std::thread::sleep(Duration::from_millis(10));
         }
+        self.set_volume(target);
     }
 
     pub fn stop(&self) {
         self.stop_queued.store(true, Ordering::Relaxed);
     }
-}
-
-fn num(x: &str) -> anyhow::Result<f32> {
-    x.trim().parse::<f32>().map_err(anyhow::Error::msg)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -611,6 +612,7 @@ struct Player {
     rx: Receiver<Vec<f32>>,
     shared: Arc<Shared>,
     volume: Arc<AtomicU32>,
+    last_vol: f32,
     channels: usize,
     ceiling: f32,
     cur: Vec<f32>,
@@ -625,10 +627,12 @@ impl Player {
         channels: usize,
         ceiling: f32,
     ) -> Self {
+        let last_vol = f32::from_bits(volume.load(Ordering::Relaxed));
         Self {
             rx,
             shared,
             volume,
+            last_vol,
             channels: std::cmp::Ord::max(channels, 1),
             ceiling,
             cur: Vec::new(),
@@ -638,9 +642,14 @@ impl Player {
 
     fn fill(&mut self, data: &mut [f32]) {
         let ceiling = self.ceiling;
-        let vol = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        let target = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        let start = self.last_vol;
+        let total_frames = std::cmp::Ord::max(data.len() / self.channels, 1);
+        let step = (target - start) / total_frames as f32;
+        self.last_vol = target;
         let mut emitted = 0usize;
-        for frame in data.chunks_mut(self.channels) {
+        for (i, frame) in data.chunks_mut(self.channels).enumerate() {
+            let vol = start + step * (i + 1) as f32;
             if frame.len() != self.channels {
                 frame.fill(0.0);
                 continue;
@@ -855,24 +864,22 @@ mod safety_tests {
 pub fn warn_extreme_settings(args: &Args) -> Vec<&str> {
     let mut res = vec![];
     if args.preamp.is_some_and(|gain| gain > 12.0) {
-        res.push("WARNING: preamp boost above +12 dB can create very high internal levels.");
+        res.push("WARNING: preamp boost above +12 dB can create very high internal levels");
     }
     if args.postamp.is_some_and(|gain| gain > 12.0) {
-        res.push("WARNING: postamp boost above +12 dB can create very high internal levels.");
+        res.push("WARNING: postamp boost above +12 dB can create very high internal levels");
     }
     if args.comp.is_some_and(|comp| comp.makeup > 6.0) {
-        res.push("WARNING: compressor makeup gain above +6 dB can substantially increase output.");
+        res.push("WARNING: compressor makeup gain above +6 dB can substantially increase output");
     }
 
     let total_eq_boost: f32 = args.eq.iter().map(|band| band.gain.max(0.0)).sum();
     if args.eq.iter().any(|band| band.gain > 6.0) || total_eq_boost > 12.0 {
-        res.push("WARNING: large or accumulated EQ boosts can create substantial signal gain.");
+        res.push("WARNING: large or accumulated EQ boosts can create substantial signal gain");
     }
 
-    if args.ceiling > -12.0 {
-        res.push(
-            "WARNING: output ceiling is above the conservative -12 dBFS default. Verify gain staging and hardware protection.",
-        );
+    if args.ceiling > -11.9 {
+        res.push("WARNING: output ceiling is above the conservative -12 dBFS default");
     }
     res
 }
