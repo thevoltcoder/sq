@@ -6,6 +6,7 @@ use cpal::{
 use fundsp::prelude32::*;
 use rubato::{Fft, FixedSync, Resampler as _, audioadapter_buffers::direct::InterleavedSlice};
 use std::{
+    collections::VecDeque,
     io::Write,
     sync::{
         Arc, RwLock,
@@ -26,7 +27,8 @@ const RELEASE_SECS: f32 = 0.1;
 const WINDOW_DIV: usize = 100;
 
 const DC_BLOCK_HZ: f32 = 20.0;
-const QUEUE_DEPTH: usize = 4;
+const QUEUE_DEPTH: usize = 8;
+const SAFETY_CEILING: f32 = 0.98;
 
 #[derive(Clone, Debug)]
 pub struct Args {
@@ -40,6 +42,7 @@ pub struct Args {
     pub comp: Option<Compressor>,
     pub ceiling: f32,
     pub volume: Arc<AtomicU32>,
+    pub gain: Arc<AtomicU32>,
     pub stop_queued: Arc<AtomicBool>,
     pub live_filters: Arc<RwLock<FilterSettings>>,
     pub live_ceiling: Arc<AtomicU32>,
@@ -58,6 +61,7 @@ impl Default for Args {
             comp: None,
             ceiling: -12.0,
             volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             stop_queued: Arc::new(AtomicBool::new(false)),
             live_filters: Arc::new(RwLock::new(FilterSettings::default())),
             live_ceiling: Arc::new(AtomicU32::new(10.0_f32.powf(-12.0 / 20.0).to_bits())),
@@ -70,7 +74,6 @@ impl Args {
         if let Ok(mut settings) = self.live_filters.write() {
             *settings = FilterSettings {
                 preamp: source.preamp,
-                postamp: source.postamp,
                 hpf: source.hpf,
                 lpf: source.lpf,
                 gate: source.gate,
@@ -83,6 +86,12 @@ impl Args {
                 Ordering::Relaxed,
             );
         }
+    }
+
+    pub fn set_gain_db(&self, db: f32) {
+        let lin = 10f32.powf(db / 20.0);
+        let lin = if lin.is_finite() { lin } else { 1.0 };
+        self.gain.store(lin.to_bits(), Ordering::Relaxed);
     }
 
     pub fn set_volume(&self, gain: f32) {
@@ -148,7 +157,6 @@ pub struct Compressor {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FilterSettings {
     preamp: Option<f32>,
-    postamp: Option<f32>,
     hpf: Option<f32>,
     lpf: Option<f32>,
     gate: Option<NoiseGate>,
@@ -157,11 +165,21 @@ pub struct FilterSettings {
     ceiling: f32,
 }
 
+impl FilterSettings {
+    fn same_chain(&self, other: &Self) -> bool {
+        self.preamp == other.preamp
+            && self.hpf == other.hpf
+            && self.lpf == other.lpf
+            && self.gate == other.gate
+            && self.eq == other.eq
+            && self.comp == other.comp
+    }
+}
+
 impl Default for FilterSettings {
     fn default() -> Self {
         Self {
             preamp: None,
-            postamp: None,
             hpf: None,
             lpf: None,
             gate: None,
@@ -209,8 +227,8 @@ fn build_chain(args: &FilterSettings, rate: f64) -> Vec<Box<dyn AudioUnit>> {
 
     chain.push(Box::new(highpass_hz(DC_BLOCK_HZ, 0.707)));
 
-    if let Some(db) = args.preamp {
-        chain.push(Box::new((pass() * db_amp(db)) >> shape(Tanh(1.0))));
+    if let Some(db) = args.preamp.filter(|d| d.abs() > 1e-3) {
+        chain.push(Box::new(pass() * db_amp(db)));
     }
 
     if let Some(hz) = args.hpf {
@@ -274,10 +292,6 @@ fn build_chain(args: &FilterSettings, rate: f64) -> Vec<Box<dyn AudioUnit>> {
         chain.push(Box::new(lowpass_hz(hz, 0.707)));
     }
 
-    if let Some(db) = args.postamp {
-        chain.push(Box::new((pass() * db_amp(db)) >> shape(Tanh(1.0))));
-    }
-
     chain.push(Box::new(highpass_hz(DC_BLOCK_HZ, 0.707)));
 
     for stage in &mut chain {
@@ -332,15 +346,19 @@ struct Limiter {
     ceiling: f32,
     release_coef: f32,
     delay: Vec<f32>,
-    peaks: Vec<f32>,
     delay_idx: usize,
-    peak_idx: usize,
+    counter: u64,
+    mins: VecDeque<(u64, f32)>,
+    avg_buf: Vec<f32>,
+    avg_idx: usize,
+    avg_sum: f64,
     gain: f32,
 }
 
 impl Limiter {
     fn new(rate: u32, channels: usize, ceiling: f32) -> Self {
         let lookahead = std::cmp::Ord::max((rate as f32 * LOOKAHEAD_SECS) as usize, 1);
+        let avg_len = lookahead + 1;
 
         Self {
             channels,
@@ -348,36 +366,58 @@ impl Limiter {
             ceiling,
             release_coef: 1.0 - (-1.0 / (rate as f32 * RELEASE_SECS)).exp(),
             delay: vec![0.0; lookahead * channels],
-
-            peaks: vec![0.0; lookahead + 1],
-
             delay_idx: 0,
-            peak_idx: 0,
+            counter: 0,
+            mins: VecDeque::new(),
+            avg_buf: vec![1.0; avg_len],
+            avg_idx: 0,
+            avg_sum: avg_len as f64,
             gain: 1.0,
         }
     }
 
     fn process(&mut self, samples: &mut [f32]) {
+        let avg_len = self.avg_buf.len();
         for frame in samples.chunks_mut(self.channels) {
             let input_peak = frame
                 .iter()
                 .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
 
-            self.peaks[self.peak_idx] = input_peak;
-            self.peak_idx = (self.peak_idx + 1) % self.peaks.len();
-
-            let window_peak = self.peaks.iter().copied().fold(0.0_f32, f32::max);
-
-            let target_gain = if window_peak > self.ceiling {
-                self.ceiling / window_peak
+            let target = if input_peak > self.ceiling {
+                self.ceiling / input_peak
             } else {
                 1.0
             };
 
-            self.gain = if target_gain < self.gain {
-                target_gain
+            while let Some(&(_, back)) = self.mins.back() {
+                if back >= target {
+                    self.mins.pop_back();
+                } else {
+                    break;
+                }
+            }
+            self.mins.push_back((self.counter, target));
+            while let Some(&(idx, _)) = self.mins.front() {
+                if idx + (self.lookahead as u64) < self.counter {
+                    self.mins.pop_front();
+                } else {
+                    break;
+                }
+            }
+            self.counter += 1;
+
+            let window_min = self.mins.front().map(|&(_, v)| v).unwrap_or(1.0);
+
+            self.avg_sum -= self.avg_buf[self.avg_idx] as f64;
+            self.avg_buf[self.avg_idx] = window_min;
+            self.avg_sum += window_min as f64;
+            self.avg_idx = (self.avg_idx + 1) % avg_len;
+            let smoothed = (self.avg_sum / avg_len as f64) as f32;
+
+            self.gain = if smoothed < self.gain {
+                smoothed
             } else {
-                self.gain + (target_gain - self.gain) * self.release_coef
+                self.gain + (smoothed - self.gain) * self.release_coef
             };
 
             let delay_base = self.delay_idx * self.channels;
@@ -445,10 +485,14 @@ struct Pipeline {
     rate: u32,
     chains: Vec<ChannelChain>,
     limiter: Limiter,
+    safety: Limiter,
     ceiling: f32,
     tx: SyncSender<Vec<f32>>,
     live_filters: Arc<RwLock<FilterSettings>>,
     settings: FilterSettings,
+    gain: Arc<AtomicU32>,
+    last_gain: f32,
+    last_in: Vec<f32>,
 }
 
 impl Pipeline {
@@ -465,6 +509,8 @@ impl Pipeline {
             .clone();
         check_nyquist(&settings, rate)?;
         let ceiling = 10f32.powf(settings.ceiling / 20.0);
+        let gain = Arc::clone(&args.gain);
+        let last_gain = f32::from_bits(gain.load(Ordering::Relaxed));
         Ok(Self {
             channels,
             rate,
@@ -472,33 +518,64 @@ impl Pipeline {
                 .map(|_| ChannelChain::new(&settings, rate as f64))
                 .collect(),
             limiter: Limiter::new(rate, channels, ceiling),
+            safety: Limiter::new(rate, channels, SAFETY_CEILING),
             ceiling,
             tx,
             live_filters,
             settings,
+            gain,
+            last_gain,
+            last_in: Vec::new(),
         })
     }
 
-    fn refresh_filters(&mut self) -> anyhow::Result<()> {
+    fn refresh_filters(&mut self) -> anyhow::Result<Option<Vec<ChannelChain>>> {
         let settings = self
             .live_filters
             .read()
             .map_err(|_| anyhow::anyhow!("live filter settings lock poisoned"))?
             .clone();
-        if settings != self.settings {
-            check_nyquist(&settings, self.rate)?;
-            self.ceiling = 10f32.powf(settings.ceiling / 20.0);
-            self.limiter.ceiling = self.ceiling;
-            self.chains = (0..self.channels)
+        if settings == self.settings {
+            return Ok(None);
+        }
+        check_nyquist(&settings, self.rate)?;
+        self.ceiling = 10f32.powf(settings.ceiling / 20.0);
+        self.limiter.ceiling = self.ceiling;
+
+        let mut old = None;
+        if !settings.same_chain(&self.settings) {
+            let mut fresh: Vec<ChannelChain> = (0..self.channels)
                 .map(|_| ChannelChain::new(&settings, self.rate as f64))
                 .collect();
-            self.settings = settings;
+            if !self.last_in.is_empty() {
+                let mut prime = self.last_in.clone();
+                apply_filters(&mut prime, self.channels, &mut fresh);
+            }
+            old = Some(std::mem::replace(&mut self.chains, fresh));
         }
-        Ok(())
+        self.settings = settings;
+        Ok(old)
+    }
+
+    fn apply_gain(&mut self, chunk: &mut [f32]) {
+        let raw = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        let target = if raw.is_finite() { raw } else { 1.0 };
+        let start = self.last_gain;
+        self.last_gain = target;
+        if start == 1.0 && target == 1.0 {
+            return;
+        }
+        let frames = std::cmp::Ord::max(chunk.len() / self.channels, 1);
+        for (i, frame) in chunk.chunks_mut(self.channels).enumerate() {
+            let g = start + (target - start) * (i + 1) as f32 / frames as f32;
+            for s in frame.iter_mut() {
+                *s *= g;
+            }
+        }
     }
 
     fn push(&mut self, mut chunk: Vec<f32>, last: bool) -> anyhow::Result<bool> {
-        self.refresh_filters()?;
+        let old = self.refresh_filters()?;
         let usable = chunk.len() / self.channels * self.channels;
         chunk.truncate(usable);
 
@@ -509,18 +586,33 @@ impl Pipeline {
                 }
             }
 
+            let dry = match old {
+                Some(mut old_chains) => {
+                    let mut d = chunk.clone();
+                    apply_filters(&mut d, self.channels, &mut old_chains);
+                    Some(d)
+                }
+                None => None,
+            };
+
+            self.last_in.clear();
+            self.last_in.extend_from_slice(&chunk);
+
             apply_filters(&mut chunk, self.channels, &mut self.chains);
+
+            if let Some(d) = dry {
+                let frames = std::cmp::Ord::max(chunk.len() / self.channels, 1);
+                for i in 0..frames {
+                    let t = (i + 1) as f32 / frames as f32;
+                    for c in 0..self.channels {
+                        let idx = i * self.channels + c;
+                        chunk[idx] = d[idx] * (1.0 - t) + chunk[idx] * t;
+                    }
+                }
+            }
 
             if chunk.iter().any(|s| !s.is_finite()) {
                 bail!("filter output became non-finite, aborting");
-            }
-
-            self.limiter.process(&mut chunk);
-
-            for s in chunk.iter_mut() {
-                if !s.is_finite() {
-                    *s = 0.0;
-                }
             }
 
             self.limiter.process(&mut chunk);
@@ -531,11 +623,21 @@ impl Pipeline {
             chunk.extend_from_slice(&tail);
         }
 
+        if !chunk.is_empty() {
+            self.apply_gain(&mut chunk);
+            self.safety.process(&mut chunk);
+        }
+
+        if last {
+            let tail = self.safety.drain();
+            chunk.extend_from_slice(&tail);
+        }
+
         for s in chunk.iter_mut() {
             if !s.is_finite() {
                 *s = 0.0;
             }
-            *s = s.clamp(-self.ceiling, self.ceiling);
+            *s = s.clamp(-SAFETY_CEILING, SAFETY_CEILING);
         }
 
         if chunk.is_empty() {
@@ -667,7 +769,6 @@ struct Player {
     rx: Receiver<Vec<f32>>,
     shared: Arc<Shared>,
     volume: Arc<AtomicU32>,
-    ceiling: Arc<AtomicU32>,
     last_vol: f32,
     channels: usize,
     cur: Vec<f32>,
@@ -679,7 +780,6 @@ impl Player {
         rx: Receiver<Vec<f32>>,
         shared: Arc<Shared>,
         volume: Arc<AtomicU32>,
-        ceiling: Arc<AtomicU32>,
         channels: usize,
     ) -> Self {
         let last_vol = f32::from_bits(volume.load(Ordering::Relaxed));
@@ -687,7 +787,6 @@ impl Player {
             rx,
             shared,
             volume,
-            ceiling,
             last_vol,
             channels: std::cmp::Ord::max(channels, 1),
             cur: Vec::new(),
@@ -696,7 +795,6 @@ impl Player {
     }
 
     fn fill(&mut self, data: &mut [f32]) {
-        let ceiling = f32::from_bits(self.ceiling.load(Ordering::Relaxed));
         let target = f32::from_bits(self.volume.load(Ordering::Relaxed));
         let start = self.last_vol;
         let total_frames = std::cmp::Ord::max(data.len() / self.channels, 1);
@@ -732,7 +830,7 @@ impl Player {
                     let value = self.cur[self.pos];
                     self.pos += 1;
                     *sample = if value.is_finite() {
-                        (value * vol).clamp(-ceiling, ceiling)
+                        (value * vol).clamp(-1.0, 1.0)
                     } else {
                         0.0
                     };
@@ -781,7 +879,6 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         rx,
         Arc::clone(&shared),
         Arc::clone(&args.volume),
-        Arc::clone(&args.live_ceiling),
         channels as usize,
     );
 

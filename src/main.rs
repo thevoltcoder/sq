@@ -11,7 +11,7 @@ use std::{
 slint::slint! {
     #[edition = "1.19"]
 
-    import { Button, Slider, CheckBox, TabWidget, LineEdit, ScrollView } from "std-widgets.slint";
+    import { Button, Slider, CheckBox, TabWidget, LineEdit, ScrollView, Palette } from "std-widgets.slint";
 
     export global Bridge {
         callback edited(int, bool, float);
@@ -218,7 +218,7 @@ slint::slint! {
             }
 
             Rectangle {
-                background: #e3e3e3;
+                background: Palette.color-scheme == ColorScheme.dark ? #2b2b2b : #e3e3e3;
                 height: 44px;
                 border-radius: 4px;
                 clip: true;
@@ -239,6 +239,7 @@ slint::slint! {
             Text {
                 visible: root.error != "";
                 text: root.error;
+                font-size: 10px;
             }
         }
     }
@@ -356,10 +357,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Ok(slot) = session.lock()
                 && let Some(args) = slot.as_ref()
             {
-                args.update_filters(&Args {
-                    postamp: Some(gain),
-                    ..Default::default()
-                });
+                args.set_gain_db(gain);
             }
         }
     });
