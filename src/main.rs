@@ -33,7 +33,7 @@ slint::slint! {
         pure callback time(float) -> string;
     }
 
-    export struct CueData {
+    export struct queueData {
         name: string,
         queue: string,
         path: string,
@@ -42,7 +42,7 @@ slint::slint! {
         error: string,
         warnings: [string],
         delay: float,
-        fade_cue: bool,
+        fade_queue: bool,
         fade_target: string,
         fade_duration: float,
         length: float,
@@ -110,8 +110,8 @@ slint::slint! {
         }
     }
 
-    component CueRow inherits Rectangle {
-        in property <CueData> data;
+    component queueRow inherits Rectangle {
+        in property <queueData> data;
         in property <bool> selected;
         in property <int> index;
 
@@ -155,7 +155,7 @@ slint::slint! {
                 background: Palette.color-scheme == ColorScheme.dark ? #555555 : #bbbbbb;
             }
             Text {
-                text: root.data.fade_cue ? "fade cue" : root.data.file;
+                text: root.data.fade_queue ? "fade queue" : root.data.file;
                 width: 140px;
                 font-size: 10px;
                 overflow: TextOverflow.elide;
@@ -166,7 +166,7 @@ slint::slint! {
                 background: Palette.color-scheme == ColorScheme.dark ? #555555 : #bbbbbb;
             }
             Text {
-                text: Fmt.time(root.data.fade_cue ? root.data.fade_duration : root.data.length);
+                text: Fmt.time(root.data.fade_queue ? root.data.fade_duration : root.data.length);
                 width: 55px;
                 font-size: 10px;
                 horizontal-alignment: right;
@@ -182,7 +182,7 @@ slint::slint! {
         min-width: 700px;
         min-height: 520px;
 
-        in property <[CueData]> cues;
+        in property <[queueData]> queues;
         in-out property <int> selected: 0;
 
         callback start(int);
@@ -192,39 +192,39 @@ slint::slint! {
         callback path-edited(int, string);
         callback gain-changed(int, float);
         callback show-filters(int);
-        callback add-cue();
-        callback delete-cue(int);
+        callback add-queue();
+        callback delete-queue(int);
         callback name-edited(int, string);
         callback queue-edited(int, string);
         callback delay-edited(int, float);
-        callback fade-cue-edited(int, bool);
+        callback fade-queue-edited(int, bool);
         callback fade-target-edited(int, string);
         callback fade-duration-edited(int, float);
 
-        property <string> model-path: root.cues[root.selected].path;
-        property <string> model-name: root.cues[root.selected].name;
-        property <string> model-queue: root.cues[root.selected].queue;
-        property <float> model-gain: root.cues[root.selected].gain;
-        property <float> model-delay: root.cues[root.selected].delay;
-        property <bool> model-fade-cue: root.cues[root.selected].fade_cue;
-        property <string> model-fade-target: root.cues[root.selected].fade_target;
-        property <float> model-fade-duration: root.cues[root.selected].fade_duration;
+        property <string> model-path: root.queues[root.selected].path;
+        property <string> model-name: root.queues[root.selected].name;
+        property <string> model-queue: root.queues[root.selected].queue;
+        property <float> model-gain: root.queues[root.selected].gain;
+        property <float> model-delay: root.queues[root.selected].delay;
+        property <bool> model-fade-queue: root.queues[root.selected].fade_queue;
+        property <string> model-fade-target: root.queues[root.selected].fade_target;
+        property <float> model-fade-duration: root.queues[root.selected].fade_duration;
         property <string> path: "";
-        property <string> cue-name: "";
+        property <string> queue-name: "";
         property <string> queue: "";
         property <string> fade-target: "";
         property <string> delay-txt: "0";
         property <string> fade-duration-txt: "1";
         property <float> gain: 0.0;
         property <string> gain-txt: "0";
-        property <bool> fade-cue: false;
+        property <bool> fade-queue: false;
 
         changed model-path => { root.path = root.model-path; }
-        changed model-name => { root.cue-name = root.model-name; }
+        changed model-name => { root.queue-name = root.model-name; }
         changed model-queue => { root.queue = root.model-queue; }
         changed model-gain => { root.gain = root.model-gain; }
         changed model-delay => { root.delay-txt = "" + root.model-delay; }
-        changed model-fade-cue => { root.fade-cue = root.model-fade-cue; }
+        changed model-fade-queue => { root.fade-queue = root.model-fade-queue; }
         changed model-fade-target => { root.fade-target = root.model-fade-target; }
         changed model-fade-duration => { root.fade-duration-txt = "" + root.model-fade-duration; }
         changed gain => { root.gain-txt = "" + Math.round(root.gain); }
@@ -238,9 +238,9 @@ slint::slint! {
                     return accept;
                 }
                 if (event.text == " ") {
-                    if (root.fade-cue) { root.fade(root.selected); }
+                    if (root.fade-queue) { root.fade(root.selected); }
                     else { root.start(root.selected); }
-                    if (root.selected + 1 < root.cues.length) {
+                    if (root.selected + 1 < root.queues.length) {
                         root.selected += 1;
                     }
                     return accept;
@@ -255,11 +255,11 @@ slint::slint! {
 
                 ScrollView {
                     height: root.height - 330px;
-                    content-height: root.cues.length * 34px;
+                    content-height: root.queues.length * 34px;
                     VerticalLayout {
                         spacing: 2px;
                         alignment: LayoutAlignment.start;
-                        for t[i] in root.cues : CueRow {
+                        for t[i] in root.queues : queueRow {
                             width: root.width - 52px;
                             height: 32px;
                             data: t;
@@ -282,8 +282,8 @@ slint::slint! {
                             spacing: 8px;
                             LineEdit {
                                 width: 145px;
-                                text <=> root.cue-name;
-                                placeholder-text: "Cue name";
+                                text <=> root.queue-name;
+                                placeholder-text: "queue name";
                                 edited(t) => { root.name-edited(root.selected, t); }
                             }
                             LineEdit {
@@ -316,17 +316,17 @@ slint::slint! {
                                 }
                             }
                             CheckBox {
-                                text: "Fade cue";
-                                checked: root.fade-cue;
+                                text: "Fade queue";
+                                checked: root.fade-queue;
                                 toggled => {
-                                    root.fade-cue = self.checked;
-                                    root.fade-cue-edited(root.selected, self.checked);
+                                    root.fade-queue = self.checked;
+                                    root.fade-queue-edited(root.selected, self.checked);
                                 }
                             }
                             LineEdit {
                                 width: 100px;
                                 text <=> root.fade-target;
-                                enabled: root.fade-cue;
+                                enabled: root.fade-queue;
                                 placeholder-text: "Target queue ID";
                                 edited(t) => { root.fade-target-edited(root.selected, t); }
                             }
@@ -334,7 +334,7 @@ slint::slint! {
                             LineEdit {
                                 width: 75px;
                                 text <=> root.fade-duration-txt;
-                                enabled: root.fade-cue;
+                                enabled: root.fade-queue;
                                 input-type: InputType.decimal;
                                 accepted(t) => {
                                     root.fade-duration-txt = t;
@@ -366,12 +366,12 @@ slint::slint! {
 
                         HorizontalLayout {
                             spacing: 8px;
-                            Button { text: "+ Add cue"; clicked => { root.add-cue(); } }
-                            Button { text: "Delete cue"; clicked => { root.delete-cue(root.selected); } }
+                            Button { text: "+ Add queue"; clicked => { root.add-queue(); } }
+                            Button { text: "Delete queue"; clicked => { root.delete-queue(root.selected); } }
                             Button {
-                                text: root.fade-cue ? "Run fade cue" : "Play cue";
+                                text: root.fade-queue ? "Run fade queue" : "Play queue";
                                 clicked => {
-                                    if (root.fade-cue) { root.fade(root.selected); }
+                                    if (root.fade-queue) { root.fade(root.selected); }
                                     else { root.start(root.selected); }
                                 }
                             }
@@ -388,12 +388,12 @@ slint::slint! {
                                 VerticalLayout {
                                     padding: 4px;
                                     spacing: 2px;
-                                    for warn in root.cues[root.selected].warnings : Text {
+                                    for warn in root.queues[root.selected].warnings : Text {
                                         text: warn;
                                         font-size: 10px;
                                     }
                                     Text {
-                                        text: root.cues[root.selected].error;
+                                        text: root.queues[root.selected].error;
                                         font-size: 10px;
                                         color: #dd4444;
                                         overflow: TextOverflow.elide;
@@ -408,8 +408,8 @@ slint::slint! {
     }
 
     export component FilterWindow inherits Window {
-        in property <string> cue-name;
-        title: "Cue Filters: " + root.cue-name;
+        in property <string> queue-name;
+        title: "queue Filters: " + root.queue-name;
         min-width: 600px;
         min-height: 400px;
 
@@ -486,18 +486,18 @@ slint::slint! {
     }
 }
 
-struct Cue {
+struct Queue {
     params: Arc<Mutex<Filters>>,
     session: Arc<Mutex<Option<Args>>>,
     filter_ui: FilterWindow,
 }
 
-impl Cue {
+impl Queue {
     fn new(name: &str) -> Result<Self, slint::PlatformError> {
         let params = Arc::new(Mutex::new(Filters::default()));
         let session: Arc<Mutex<Option<Args>>> = Arc::new(Mutex::new(None));
         let filter_ui = FilterWindow::new()?;
-        filter_ui.set_cue_name(name.into());
+        filter_ui.set_queue_name(name.into());
 
         filter_ui.global::<Bridge>().on_edited({
             let params = params.clone();
@@ -554,7 +554,7 @@ fn audio_secs(path: &str) -> anyhow::Result<f32> {
         .as_secs_f64() as f32)
 }
 
-fn set_path(d: &mut CueData, path: SharedString) {
+fn set_path(d: &mut queueData, path: SharedString) {
     let file = Path::new(path.as_str())
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
@@ -570,7 +570,7 @@ fn load_audio_length(weak: slint::Weak<MainWindow>, idx: usize, path: String) {
         let length = audio_secs(&path).unwrap_or(0.0);
 
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            edit_row(&ui.get_cues(), idx, |d| {
+            edit_row(&ui.get_queues(), idx, |d| {
                 if d.path == path.as_str() {
                     d.length = length;
                 }
@@ -579,14 +579,14 @@ fn load_audio_length(weak: slint::Weak<MainWindow>, idx: usize, path: String) {
     });
 }
 
-fn add_cue(
-    model: &VecModel<CueData>,
-    cues: &RefCell<Vec<Cue>>,
+fn add_queue(
+    model: &VecModel<queueData>,
+    queues: &RefCell<Vec<Queue>>,
 ) -> Result<(), slint::PlatformError> {
-    let name = format!("Cue {}", cues.borrow().len() + 1);
-    let cue = Cue::new(&name)?;
-    cues.borrow_mut().push(cue);
-    model.push(CueData {
+    let name = format!("queue {}", queues.borrow().len() + 1);
+    let queue = Queue::new(&name)?;
+    queues.borrow_mut().push(queue);
+    model.push(queueData {
         name: name.into(),
         queue: SharedString::new(),
         path: SharedString::new(),
@@ -595,7 +595,7 @@ fn add_cue(
         error: SharedString::new(),
         warnings: ModelRc::default(),
         delay: 0.0,
-        fade_cue: false,
+        fade_queue: false,
         fade_target: SharedString::new(),
         fade_duration: 1.0,
         length: 0.0,
@@ -603,7 +603,7 @@ fn add_cue(
     Ok(())
 }
 
-fn edit_row(model: &impl Model<Data = CueData>, i: usize, f: impl FnOnce(&mut CueData)) {
+fn edit_row(model: &impl Model<Data = queueData>, i: usize, f: impl FnOnce(&mut queueData)) {
     if let Some(mut d) = model.row_data(i) {
         f(&mut d);
         model.set_row_data(i, d);
@@ -616,8 +616,8 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     let main_ui = MainWindow::new()?;
-    let model = Rc::new(VecModel::<CueData>::default());
-    let cues = Rc::new(RefCell::new(Vec::<Cue>::new()));
+    let model = Rc::new(VecModel::<queueData>::default());
+    let queues = Rc::new(RefCell::new(Vec::<Queue>::new()));
     let playback_lock = Arc::new(Mutex::new(()));
     let playback_generation = Arc::new(AtomicU64::new(0));
     let fading: Arc<Mutex<Vec<(u64, Args)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -628,25 +628,25 @@ fn main() -> Result<(), slint::PlatformError> {
         format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60).into()
     });
 
-    add_cue(&model, &cues)?;
-    main_ui.set_cues(ModelRc::from(model.clone()));
+    add_queue(&model, &queues)?;
+    main_ui.set_queues(ModelRc::from(model.clone()));
 
-    main_ui.on_add_cue({
+    main_ui.on_add_queue({
         let model = model.clone();
-        let cues = cues.clone();
+        let queues = queues.clone();
         move || {
-            let _ = add_cue(&model, &cues);
+            let _ = add_queue(&model, &queues);
         }
     });
 
     main_ui.on_name_edited({
         let model = model.clone();
-        let cues = cues.clone();
+        let queues = queues.clone();
         move |idx, name| {
             let idx = idx as usize;
             edit_row(&*model, idx, |d| d.name = name.clone());
-            if let Some(cue) = cues.borrow().get(idx) {
-                cue.filter_ui.set_cue_name(name);
+            if let Some(queue) = queues.borrow().get(idx) {
+                queue.filter_ui.set_queue_name(name);
             }
         }
     });
@@ -665,10 +665,10 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    main_ui.on_fade_cue_edited({
+    main_ui.on_fade_queue_edited({
         let model = model.clone();
         move |idx, enabled| {
-            edit_row(&*model, idx as usize, |d| d.fade_cue = enabled);
+            edit_row(&*model, idx as usize, |d| d.fade_queue = enabled);
         }
     });
 
@@ -688,9 +688,9 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    main_ui.on_delete_cue({
+    main_ui.on_delete_queue({
         let model = model.clone();
-        let cues = cues.clone();
+        let queues = queues.clone();
         let weak = main_ui.as_weak();
         let playback_generation = playback_generation.clone();
         move |idx| {
@@ -701,7 +701,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
             playback_generation.fetch_add(1, Ordering::SeqCst);
 
-            let removed = cues.borrow_mut().remove(idx);
+            let removed = queues.borrow_mut().remove(idx);
             if let Ok(mut slot) = removed.session.lock() {
                 if let Some(args) = slot.take() {
                     args.stop();
@@ -736,10 +736,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
     main_ui.on_gain_changed({
         let model = model.clone();
-        let cues = cues.clone();
+        let queues = queues.clone();
         move |idx, gain| {
             edit_row(&*model, idx as usize, |d| d.gain = gain);
-            if let Some(t) = cues.borrow().get(idx as usize)
+            if let Some(t) = queues.borrow().get(idx as usize)
                 && let Ok(slot) = t.session.lock()
                 && let Some(args) = slot.as_ref()
             {
@@ -750,7 +750,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     main_ui.on_start({
         let model = model.clone();
-        let cues = cues.clone();
+        let queues = queues.clone();
         let weak = main_ui.as_weak();
         let playback_lock = playback_lock.clone();
         let playback_generation = playback_generation.clone();
@@ -763,19 +763,19 @@ fn main() -> Result<(), slint::PlatformError> {
             };
 
             let (params, session) = {
-                let all = cues.borrow();
-                let Some(cue) = all.get(idx) else {
+                let all = queues.borrow();
+                let Some(queue) = all.get(idx) else {
                     return;
                 };
-                (cue.params.clone(), cue.session.clone())
+                (queue.params.clone(), queue.session.clone())
             };
 
             let generation = playback_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
-            let sessions: Vec<_> = cues
+            let sessions: Vec<_> = queues
                 .borrow()
                 .iter()
-                .map(|cue| cue.session.clone())
+                .map(|queue| queue.session.clone())
                 .collect();
 
             for existing in sessions {
@@ -831,13 +831,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
 
                 let _ = weak.upgrade_in_event_loop(move |ui| {
-                    edit_row(&ui.get_cues(), idx, |d| d.error = "".into());
+                    edit_row(&ui.get_queues(), idx, |d| d.error = "".into());
                 });
 
                 if let Err(e) = run(&thread_args) {
                     let msg = format!("ERROR: {e:#}");
                     let _ = weak.upgrade_in_event_loop(move |ui| {
-                        edit_row(&ui.get_cues(), idx, |d| d.error = msg.into());
+                        edit_row(&ui.get_queues(), idx, |d| d.error = msg.into());
                     });
                 }
             });
@@ -846,20 +846,20 @@ fn main() -> Result<(), slint::PlatformError> {
 
     main_ui.on_fade({
         let model = model.clone();
-        let cues = cues.clone();
+        let queues = queues.clone();
         move |idx| {
-            let Some(cue) = model.row_data(idx as usize) else {
+            let Some(queue) = model.row_data(idx as usize) else {
                 return;
             };
 
-            if cue.fade_target.is_empty() {
+            if queue.fade_target.is_empty() {
                 return;
             }
 
             let target = (0..model.row_count()).find_map(|i| {
                 model
                     .row_data(i)
-                    .filter(|row| row.queue == cue.fade_target)
+                    .filter(|row| row.queue == queue.fade_target)
                     .map(|_| i)
             });
 
@@ -868,21 +868,20 @@ fn main() -> Result<(), slint::PlatformError> {
             };
 
             let session = {
-                let all = cues.borrow();
-                let Some(target_cue) = all.get(target) else {
+                let all = queues.borrow();
+                let Some(target_queue) = all.get(target) else {
                     return;
                 };
-                target_cue.session.clone()
+                target_queue.session.clone()
             };
 
-            let delay = Duration::from_secs_f32(cue.delay.max(0.0));
-            let duration = Duration::from_secs_f32(cue.fade_duration.max(0.0));
+            let delay = Duration::from_secs_f32(queue.delay.max(0.0));
+            let duration = Duration::from_secs_f32(queue.fade_duration.max(0.0));
 
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
-                if let Ok(slot) = session.lock()
-                    && let Some(args) = slot.as_ref()
-                {
+                let args = session.lock().ok().and_then(|slot| slot.clone());
+                if let Some(args) = args {
                     args.fade_to(0.0, duration);
                 }
             });
@@ -890,7 +889,7 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     main_ui.on_end_all({
-        let cues = cues.clone();
+        let queues = queues.clone();
         let playback_generation = playback_generation.clone();
         let fading = fading.clone();
         let fade_id = fade_id.clone();
@@ -898,10 +897,10 @@ fn main() -> Result<(), slint::PlatformError> {
         move || {
             playback_generation.fetch_add(1, Ordering::SeqCst);
 
-            let sessions: Vec<_> = cues
+            let sessions: Vec<_> = queues
                 .borrow()
                 .iter()
-                .map(|cue| cue.session.clone())
+                .map(|queue| queue.session.clone())
                 .collect();
 
             for session in sessions {
@@ -927,9 +926,9 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     main_ui.on_show_filters({
-        let cues = cues.clone();
+        let queues = queues.clone();
         move |idx| {
-            if let Some(t) = cues.borrow().get(idx as usize) {
+            if let Some(t) = queues.borrow().get(idx as usize) {
                 let _ = t.filter_ui.show();
             }
         }
@@ -951,7 +950,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     let path = p.to_string_lossy().to_string();
 
                     let _ = weak.upgrade_in_event_loop(move |ui| {
-                        edit_row(&ui.get_cues(), idx, |d| {
+                        edit_row(&ui.get_queues(), idx, |d| {
                             set_path(d, path.clone().into());
                         });
 
@@ -964,7 +963,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), {
-        let cues = cues.clone();
+        let queues = queues.clone();
         let weak = main_ui.as_weak();
 
         move || {
@@ -972,8 +971,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             };
 
-            let model = ui.get_cues();
-            let all_params: Vec<_> = cues.borrow().iter().map(|t| t.params.clone()).collect();
+            let model = ui.get_queues();
+            let all_params: Vec<_> = queues.borrow().iter().map(|t| t.params.clone()).collect();
 
             for (i, params) in all_params.iter().enumerate() {
                 let mut args = Args::default();
@@ -1007,9 +1006,9 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     main_ui.window().on_close_requested({
-        let cues = cues.clone();
+        let queues = queues.clone();
         move || {
-            for t in cues.borrow().iter() {
+            for t in queues.borrow().iter() {
                 let _ = t.filter_ui.hide();
             }
             slint::CloseRequestResponse::HideWindow
