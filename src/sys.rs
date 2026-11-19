@@ -781,6 +781,7 @@ impl Player {
         shared: Arc<Shared>,
         volume: Arc<AtomicU32>,
         channels: usize,
+        initial: Vec<f32>,
     ) -> Self {
         let last_vol = f32::from_bits(volume.load(Ordering::Relaxed));
         Self {
@@ -789,7 +790,7 @@ impl Player {
             volume,
             last_vol,
             channels: std::cmp::Ord::max(channels, 1),
-            cur: Vec::new(),
+            cur: initial,
             pos: 0,
         }
     }
@@ -801,46 +802,51 @@ impl Player {
         let step = (target - start) / total_frames as f32;
         self.last_vol = target;
         let mut emitted = 0usize;
+
         for (i, frame) in data.chunks_mut(self.channels).enumerate() {
-            let vol = start + step * (i + 1) as f32;
             if frame.len() != self.channels {
                 frame.fill(0.0);
                 continue;
             }
 
-            while self.pos >= self.cur.len() {
-                match self.rx.try_recv() {
-                    Ok(v) => {
-                        self.cur = v;
-                        self.pos = 0;
+            let vol = start + step * (i + 1) as f32;
+            let mut written = 0usize;
+
+            while written < frame.len() && !self.shared.stop.load(Ordering::Relaxed) {
+                if self.pos >= self.cur.len() {
+                    match self.rx.try_recv() {
+                        Ok(chunk) => {
+                            self.cur = chunk;
+                            self.pos = 0;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            self.shared.done.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
                     }
-                    Err(TryRecvError::Disconnected) => {
-                        self.shared.done.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    Err(TryRecvError::Empty) => break,
                 }
-            }
 
-            let stopping = self.shared.stop.load(Ordering::Relaxed);
-            let have_frame = !stopping && self.pos + frame.len() <= self.cur.len();
-
-            if have_frame {
-                for sample in frame.iter_mut() {
-                    let value = self.cur[self.pos];
-                    self.pos += 1;
-                    *sample = if value.is_finite() {
+                let available = self.cur.len().saturating_sub(self.pos);
+                if available == 0 {
+                    continue;
+                }
+                let count = std::cmp::Ord::min(available, frame.len() - written);
+                for offset in 0..count {
+                    let value = self.cur[self.pos + offset];
+                    frame[written + offset] = if value.is_finite() {
                         (value * vol).clamp(-1.0, 1.0)
                     } else {
                         0.0
                     };
                 }
-                emitted += frame.len();
-            } else {
-                if !stopping && self.pos < self.cur.len() {
-                    self.pos = self.cur.len();
-                }
-                frame.fill(0.0);
+                self.pos += count;
+                written += count;
+                emitted += count;
+            }
+
+            if written < frame.len() {
+                frame[written..].fill(0.0);
             }
         }
         self.shared.played.fetch_add(emitted, Ordering::Relaxed);
@@ -874,12 +880,22 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     let rate = config.sample_rate;
     rate_tx.send(rate).ok();
 
+    let initial = match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(chunk) => chunk,
+        Err(error) => match handle.join() {
+            Ok(Ok(())) => return Err(error).context("audio decoder did not produce audio"),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => bail!("decoder thread panicked"),
+        },
+    };
+
     let err_shared = Arc::clone(&shared);
     let mut player = Player::new(
         rx,
         Arc::clone(&shared),
         Arc::clone(&args.volume),
         channels as usize,
+        initial,
     );
 
     let stream = device

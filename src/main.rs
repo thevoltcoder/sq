@@ -1,3 +1,4 @@
+use anyhow::{Context, bail};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use sq::{
     filters::Filters,
@@ -7,8 +8,16 @@ use std::{
     cell::RefCell,
     path::Path,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
+};
+use symphonia::core::{
+    formats::{FormatOptions, TrackType, probe::Hint},
+    io::MediaSourceStream,
+    meta::MetadataOptions,
 };
 
 slint::slint! {
@@ -18,6 +27,10 @@ slint::slint! {
 
     export global Bridge {
         callback edited(int, bool, float);
+    }
+
+    export global Fmt {
+        pure callback time(float) -> string;
     }
 
     export struct CueData {
@@ -32,6 +45,7 @@ slint::slint! {
         fade_cue: bool,
         fade_target: string,
         fade_duration: float,
+        length: float,
     }
 
     component Param inherits HorizontalLayout {
@@ -116,7 +130,6 @@ slint::slint! {
             padding-left: 6px;
             padding-right: 6px;
             spacing: 12px;
-            alignment: LayoutAlignment.start;
 
             Text {
                 text: root.data.queue == "" ? "-" : root.data.queue;
@@ -125,21 +138,35 @@ slint::slint! {
                 font-weight: 700;
                 vertical-alignment: center;
             }
+            Rectangle {
+                width: 1px;
+                background: Palette.color-scheme == ColorScheme.dark ? #555555 : #bbbbbb;
+            }
             Text {
-                text: (root.data.fade_cue ? "[FADE] " : "") + root.data.name;
+                text: root.data.name;
+                horizontal-stretch: 1;
                 font-size: 12px;
                 font-weight: root.selected ? 700 : 400;
                 overflow: TextOverflow.elide;
                 vertical-alignment: center;
             }
+            Rectangle {
+                width: 1px;
+                background: Palette.color-scheme == ColorScheme.dark ? #555555 : #bbbbbb;
+            }
             Text {
-                text: root.data.file == "" ? "" : root.data.file;
+                text: root.data.fade_cue ? "fade cue" : root.data.file;
+                width: 140px;
                 font-size: 10px;
                 overflow: TextOverflow.elide;
                 vertical-alignment: center;
             }
+            Rectangle {
+                width: 1px;
+                background: Palette.color-scheme == ColorScheme.dark ? #555555 : #bbbbbb;
+            }
             Text {
-                text: "" + root.data.delay + "s";
+                text: Fmt.time(root.data.fade_cue ? root.data.fade_duration : root.data.length);
                 width: 55px;
                 font-size: 10px;
                 horizontal-alignment: right;
@@ -159,7 +186,7 @@ slint::slint! {
         in-out property <int> selected: 0;
 
         callback start(int);
-        callback end(int);
+        callback end-all();
         callback fade(int);
         callback browse(int);
         callback path-edited(int, string);
@@ -207,7 +234,7 @@ slint::slint! {
         fs := FocusScope {
             key-pressed(event) => {
                 if (event.text == Key.Escape) {
-                    root.end(root.selected);
+                    root.end-all();
                     return accept;
                 }
                 if (event.text == " ") {
@@ -268,7 +295,7 @@ slint::slint! {
                             LineEdit {
                                 text <=> root.path;
                                 placeholder-text: "Audio file";
-                                edited(t) => { root.path-edited(root.selected, t); }
+                                accepted(t) => { root.path-edited(root.selected, t); }
                             }
                             Button {
                                 text: "Browse...";
@@ -348,7 +375,7 @@ slint::slint! {
                                     else { root.start(root.selected); }
                                 }
                             }
-                            Button { text: "End"; clicked => { root.end(root.selected); } }
+                            Button { text: "End"; clicked => { root.end-all(); } }
                             Button { text: "Filters"; clicked => { root.show-filters(root.selected); } }
                         }
 
@@ -362,7 +389,7 @@ slint::slint! {
                                     padding: 4px;
                                     spacing: 2px;
                                     for warn in root.cues[root.selected].warnings : Text {
-                                        text: "WARNING: " + warn;
+                                        text: warn;
                                         font-size: 10px;
                                     }
                                     Text {
@@ -448,7 +475,7 @@ slint::slint! {
                         Param { idx: 18; label: "Bell 1 gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
                         Param { idx: 22; label: "Bell 2 freq"; lo: 20; hi: 18000; initial: 3000; unit: " Hz"; }
                         Param { idx: 23; label: "Bell 2 Q"; lo: 0.1; hi: 10; initial: 1; optional: false; }
-                        Param { idx: 24; label: "Bell 2 gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
+                        Param { idx: 24; label: "Bell 2 gain"; lo: 0.1; hi: 10; initial: 1; optional: false; }
                         Param { idx: 19; label: "High shelf freq"; lo: 20; hi: 18000; initial: 8000; unit: " Hz"; }
                         Param { idx: 20; label: "High shelf Q"; lo: 0.1; hi: 10; initial: 0.707; optional: false; }
                         Param { idx: 21; label: "High shelf gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
@@ -502,13 +529,54 @@ impl Cue {
     }
 }
 
+fn audio_secs(path: &str) -> anyhow::Result<f32> {
+    let Ok(file) = std::fs::File::open(path) else {
+        bail!("failed to open file");
+    };
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let Ok(format) = symphonia::default::get_probe().probe(
+        &Hint::new(),
+        mss,
+        FormatOptions::default(),
+        MetadataOptions::default(),
+    ) else {
+        bail!("symphonia failed to probe");
+    };
+    let Some(track) = format.default_track(TrackType::Audio) else {
+        bail!("failed to get track");
+    };
+    let (Some(duration), Some(time_base)) = (track.duration, track.time_base) else {
+        bail!("invalid duration and/or time base");
+    };
+    Ok(time_base
+        .calc_duration(duration)
+        .context("failed to calculate duration")?
+        .as_secs_f64() as f32)
+}
+
 fn set_path(d: &mut CueData, path: SharedString) {
     let file = Path::new(path.as_str())
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_default();
+
     d.file = file.into();
     d.path = path;
+    d.length = 0.0;
+}
+
+fn load_audio_length(weak: slint::Weak<MainWindow>, idx: usize, path: String) {
+    std::thread::spawn(move || {
+        let length = audio_secs(&path).unwrap_or(0.0);
+
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            edit_row(&ui.get_cues(), idx, |d| {
+                if d.path == path.as_str() {
+                    d.length = length;
+                }
+            });
+        });
+    });
 }
 
 fn add_cue(
@@ -530,6 +598,7 @@ fn add_cue(
         fade_cue: false,
         fade_target: SharedString::new(),
         fade_duration: 1.0,
+        length: 0.0,
     });
     Ok(())
 }
@@ -542,9 +611,22 @@ fn edit_row(model: &impl Model<Data = CueData>, i: usize, f: impl FnOnce(&mut Cu
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    unsafe {
+        std::env::set_var("SLINT_BACKEND", "winit-software");
+    }
+
     let main_ui = MainWindow::new()?;
     let model = Rc::new(VecModel::<CueData>::default());
     let cues = Rc::new(RefCell::new(Vec::<Cue>::new()));
+    let playback_lock = Arc::new(Mutex::new(()));
+    let playback_generation = Arc::new(AtomicU64::new(0));
+    let fading: Arc<Mutex<Vec<(u64, Args)>>> = Arc::new(Mutex::new(Vec::new()));
+    let fade_id = Arc::new(AtomicU64::new(0));
+
+    main_ui.global::<Fmt>().on_time(|s| {
+        let t = s.max(0.0) as u64;
+        format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60).into()
+    });
 
     add_cue(&model, &cues)?;
     main_ui.set_cues(ModelRc::from(model.clone()));
@@ -610,11 +692,14 @@ fn main() -> Result<(), slint::PlatformError> {
         let model = model.clone();
         let cues = cues.clone();
         let weak = main_ui.as_weak();
+        let playback_generation = playback_generation.clone();
         move |idx| {
             let idx = idx as usize;
             if model.row_count() <= 1 || idx >= model.row_count() {
                 return;
             }
+
+            playback_generation.fetch_add(1, Ordering::SeqCst);
 
             let removed = cues.borrow_mut().remove(idx);
             if let Ok(mut slot) = removed.session.lock() {
@@ -641,8 +726,11 @@ fn main() -> Result<(), slint::PlatformError> {
 
     main_ui.on_path_edited({
         let model = model.clone();
+        let weak = main_ui.as_weak();
         move |idx, path| {
-            edit_row(&*model, idx as usize, |d| set_path(d, path));
+            let idx = idx as usize;
+            edit_row(&*model, idx, |d| set_path(d, path.clone()));
+            load_audio_length(weak.clone(), idx, path.to_string());
         }
     });
 
@@ -664,44 +752,88 @@ fn main() -> Result<(), slint::PlatformError> {
         let model = model.clone();
         let cues = cues.clone();
         let weak = main_ui.as_weak();
+        let playback_lock = playback_lock.clone();
+        let playback_generation = playback_generation.clone();
+        let fading = fading.clone();
+
         move |idx| {
             let idx = idx as usize;
             let Some(row) = model.row_data(idx) else {
                 return;
             };
+
             let (params, session) = {
-                let cues = cues.borrow();
-                let Some(t) = cues.get(idx) else {
+                let all = cues.borrow();
+                let Some(cue) = all.get(idx) else {
                     return;
                 };
-                (t.params.clone(), t.session.clone())
+                (cue.params.clone(), cue.session.clone())
             };
 
-            let Ok(mut slot) = session.lock() else {
-                return;
-            };
-            if let Some(old) = slot.take() {
-                old.stop();
+            let generation = playback_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+            let sessions: Vec<_> = cues
+                .borrow()
+                .iter()
+                .map(|cue| cue.session.clone())
+                .collect();
+
+            for existing in sessions {
+                if let Ok(mut slot) = existing.lock() {
+                    if let Some(args) = slot.take() {
+                        args.stop();
+                    }
+                }
+            }
+
+            let purged: Vec<Args> = fading
+                .lock()
+                .map(|mut f| f.drain(..).map(|(_, a)| a).collect())
+                .unwrap_or_default();
+            for args in purged {
+                args.stop();
             }
 
             let mut args = Args {
                 file: Some(row.path.to_string()),
                 ..Default::default()
             };
+
             args.postamp = Some(row.gain);
+
             if let Ok(p) = params.lock() {
                 p.apply(&mut args);
             }
+
             args.update_filters(&args);
 
             let thread_args = args.clone();
             let delay = Duration::from_secs_f32(row.delay.max(0.0));
+
+            if let Ok(mut slot) = session.lock() {
+                *slot = Some(args);
+            }
+
             let weak = weak.clone();
+            let playback_generation = playback_generation.clone();
+            let playback_lock = playback_lock.clone();
+
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
+
+                let _guard = match playback_lock.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+
+                if playback_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     edit_row(&ui.get_cues(), idx, |d| d.error = "".into());
                 });
+
                 if let Err(e) = run(&thread_args) {
                     let msg = format!("ERROR: {e:#}");
                     let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -709,7 +841,6 @@ fn main() -> Result<(), slint::PlatformError> {
                     });
                 }
             });
-            *slot = Some(args);
         }
     });
 
@@ -720,18 +851,22 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(cue) = model.row_data(idx as usize) else {
                 return;
             };
+
             if cue.fade_target.is_empty() {
                 return;
             }
+
             let target = (0..model.row_count()).find_map(|i| {
                 model
                     .row_data(i)
                     .filter(|row| row.queue == cue.fade_target)
                     .map(|_| i)
             });
+
             let Some(target) = target else {
                 return;
             };
+
             let session = {
                 let all = cues.borrow();
                 let Some(target_cue) = all.get(target) else {
@@ -739,8 +874,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 };
                 target_cue.session.clone()
             };
+
             let delay = Duration::from_secs_f32(cue.delay.max(0.0));
             let duration = Duration::from_secs_f32(cue.fade_duration.max(0.0));
+
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
                 if let Ok(slot) = session.lock()
@@ -752,24 +889,39 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    main_ui.on_end({
+    main_ui.on_end_all({
         let cues = cues.clone();
-        move |idx| {
-            let session = {
-                let cues = cues.borrow();
-                let Some(t) = cues.get(idx as usize) else {
-                    return;
-                };
-                t.session.clone()
-            };
-            let Ok(mut slot) = session.lock() else {
-                return;
-            };
-            if let Some(a) = slot.take() {
-                std::thread::spawn(move || {
-                    a.fade_to(0.0, Duration::from_secs(1));
-                    a.stop();
-                });
+        let playback_generation = playback_generation.clone();
+        let fading = fading.clone();
+        let fade_id = fade_id.clone();
+
+        move || {
+            playback_generation.fetch_add(1, Ordering::SeqCst);
+
+            let sessions: Vec<_> = cues
+                .borrow()
+                .iter()
+                .map(|cue| cue.session.clone())
+                .collect();
+
+            for session in sessions {
+                let args = session.lock().ok().and_then(|mut slot| slot.take());
+
+                if let Some(args) = args {
+                    let id = fade_id.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut f) = fading.lock() {
+                        f.push((id, args.clone()));
+                    }
+
+                    let fading = fading.clone();
+                    std::thread::spawn(move || {
+                        args.fade_to(0.0, Duration::from_secs(1));
+                        args.stop();
+                        if let Ok(mut f) = fading.lock() {
+                            f.retain(|(i, _)| *i != id);
+                        }
+                    });
+                }
             }
         }
     });
@@ -788,6 +940,7 @@ fn main() -> Result<(), slint::PlatformError> {
         move |idx| {
             let weak = weak.clone();
             let idx = idx as usize;
+
             std::thread::spawn(move || {
                 let picked = rfd::FileDialog::new()
                     .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "m4a"])
@@ -795,10 +948,14 @@ fn main() -> Result<(), slint::PlatformError> {
                     .pick_file();
 
                 if let Some(p) = picked {
+                    let path = p.to_string_lossy().to_string();
+
                     let _ = weak.upgrade_in_event_loop(move |ui| {
                         edit_row(&ui.get_cues(), idx, |d| {
-                            set_path(d, p.to_string_lossy().to_string().into());
+                            set_path(d, path.clone().into());
                         });
+
+                        load_audio_length(ui.as_weak(), idx, path);
                     });
                 }
             });
@@ -809,17 +966,22 @@ fn main() -> Result<(), slint::PlatformError> {
     timer.start(slint::TimerMode::Repeated, Duration::from_secs(1), {
         let cues = cues.clone();
         let weak = main_ui.as_weak();
+
         move || {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
 
+            let model = ui.get_cues();
             let all_params: Vec<_> = cues.borrow().iter().map(|t| t.params.clone()).collect();
 
             for (i, params) in all_params.iter().enumerate() {
                 let mut args = Args::default();
+
                 if let Ok(p) = params.lock() {
                     p.apply(&mut args);
+                } else {
+                    continue;
                 }
 
                 let list: Vec<SharedString> = warn_extreme_settings(&args)
@@ -827,9 +989,19 @@ fn main() -> Result<(), slint::PlatformError> {
                     .map(|w| SharedString::from(w.to_string()))
                     .collect();
 
-                edit_row(&ui.get_cues(), i, |d| {
-                    d.warnings = ModelRc::new(VecModel::from(list));
+                let unchanged = model.row_data(i).is_some_and(|d| {
+                    d.warnings.row_count() == list.len()
+                        && list
+                            .iter()
+                            .enumerate()
+                            .all(|(j, warning)| d.warnings.row_data(j).as_ref() == Some(warning))
                 });
+
+                if !unchanged {
+                    edit_row(&model, i, |d| {
+                        d.warnings = ModelRc::new(VecModel::from(list));
+                    });
+                }
             }
         }
     });
