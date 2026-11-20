@@ -254,13 +254,13 @@ slint::slint! {
                 spacing: 10px;
 
                 ScrollView {
-                    height: root.height - 330px;
+                    height: (root.height) - 330px;
                     content-height: root.queues.length * 34px;
                     VerticalLayout {
                         spacing: 2px;
                         alignment: LayoutAlignment.start;
                         for t[i] in root.queues : queueRow {
-                            width: root.width - 52px;
+                            width: (root.width) - 52px;
                             height: 32px;
                             data: t;
                             index: i;
