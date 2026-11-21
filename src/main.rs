@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use sq::{
     filters::Filters,
-    sys::{Args, run, warn_extreme_settings},
+    sys::{Args, MUTE_DB, run, warn_extreme_settings},
 };
 use std::{
     cell::RefCell,
@@ -33,6 +33,18 @@ slint::slint! {
         pure callback time(float) -> string;
     }
 
+    export enum Field {
+        name,
+        queue,
+        path,
+        fade-target,
+        delay,
+        fade-duration,
+        fade-level,
+        gain,
+        fade-queue,
+    }
+
     export struct queueData {
         name: string,
         queue: string,
@@ -45,6 +57,7 @@ slint::slint! {
         fade_queue: bool,
         fade_target: string,
         fade_duration: float,
+        fade_level: float,
         length: float,
     }
 
@@ -60,10 +73,6 @@ slint::slint! {
         property <float> val: root.initial;
         property <string> txt: "" + Math.round(root.initial * 100) / 100;
         spacing: 10px;
-
-        changed val => {
-            root.txt = "" + Math.round(root.val * 100) / 100;
-        }
 
         Text {
             text: root.label;
@@ -86,6 +95,7 @@ slint::slint! {
             enabled: root.on;
             changed(v) => {
                 root.val = v;
+                root.txt = "" + Math.round(v * 100) / 100;
                 Bridge.edited(root.idx, root.on, v);
             }
         }
@@ -95,9 +105,8 @@ slint::slint! {
             enabled: root.on;
             text <=> root.txt;
             input-type: InputType.decimal;
-            accepted(t) => {
+            edited(t) => {
                 root.val = Math.clamp(t.to-float(), root.lo, root.hi);
-                root.txt = "" + Math.round(root.val * 100) / 100;
                 Bridge.edited(root.idx, root.on, root.val);
             }
         }
@@ -189,17 +198,12 @@ slint::slint! {
         callback end-all();
         callback fade(int);
         callback browse(int);
-        callback path-edited(int, string);
-        callback gain-changed(int, float);
         callback show-filters(int);
         callback add-queue();
         callback delete-queue(int);
-        callback name-edited(int, string);
-        callback queue-edited(int, string);
-        callback delay-edited(int, float);
-        callback fade-queue-edited(int, bool);
-        callback fade-target-edited(int, string);
-        callback fade-duration-edited(int, float);
+        callback edit-text(int, Field, string);
+        callback edit-num(int, Field, float);
+        callback edit-bool(int, Field, bool);
 
         property <string> model-path: root.queues[root.selected].path;
         property <string> model-name: root.queues[root.selected].name;
@@ -209,27 +213,56 @@ slint::slint! {
         property <bool> model-fade-queue: root.queues[root.selected].fade_queue;
         property <string> model-fade-target: root.queues[root.selected].fade_target;
         property <float> model-fade-duration: root.queues[root.selected].fade_duration;
+        property <float> model-fade-level: root.queues[root.selected].fade_level;
         property <string> path: "";
         property <string> queue-name: "";
         property <string> queue: "";
         property <string> fade-target: "";
         property <string> delay-txt: "0";
         property <string> fade-duration-txt: "1";
-        property <float> gain: 0.0;
-        property <string> gain-txt: "0";
+        property <float> level: 0.0;
+        property <string> level-txt: "0";
         property <bool> fade-queue: false;
+
+        function sync-level() {
+            root.level = root.fade-queue ? root.model-fade-level : root.model-gain;
+            root.level-txt = "" + Math.round(root.level);
+        }
 
         changed model-path => { root.path = root.model-path; }
         changed model-name => { root.queue-name = root.model-name; }
         changed model-queue => { root.queue = root.model-queue; }
-        changed model-gain => { root.gain = root.model-gain; }
-        changed model-delay => { root.delay-txt = "" + root.model-delay; }
+        changed model-gain => {
+            if (!root.fade-queue) {
+                root.level = root.model-gain;
+                if (root.level-txt.to-float() != root.model-gain) {
+                    root.level-txt = "" + Math.round(root.model-gain);
+                }
+            }
+        }
+        changed model-delay => {
+            if (root.delay-txt.to-float() != root.model-delay) {
+                root.delay-txt = "" + root.model-delay;
+            }
+        }
         changed model-fade-queue => { root.fade-queue = root.model-fade-queue; }
+        changed fade-queue => { root.sync-level(); }
         changed model-fade-target => { root.fade-target = root.model-fade-target; }
-        changed model-fade-duration => { root.fade-duration-txt = "" + root.model-fade-duration; }
-        changed gain => { root.gain-txt = "" + Math.round(root.gain); }
+        changed model-fade-duration => {
+            if (root.fade-duration-txt.to-float() != root.model-fade-duration) {
+                root.fade-duration-txt = "" + root.model-fade-duration;
+            }
+        }
+        changed model-fade-level => {
+            if (root.fade-queue) {
+                root.level = root.model-fade-level;
+                if (root.level-txt.to-float() != root.model-fade-level) {
+                    root.level-txt = "" + Math.round(root.model-fade-level);
+                }
+            }
+        }
 
-        init => { fs.focus(); }
+        init => { root.sync-level(); fs.focus(); }
 
         fs := FocusScope {
             key-pressed(event) => {
@@ -245,6 +278,14 @@ slint::slint! {
                     }
                     return accept;
                 }
+                if (event.text == Key.UpArrow) {
+                    if (root.selected > 0) { (root.selected) -= 1; }
+                    return accept;
+                }
+                if (event.text == Key.DownArrow) {
+                    if (root.selected + 1 < root.queues.length) { root.selected += 1; }
+                    return accept;
+                }
                 return reject;
             }
 
@@ -254,24 +295,23 @@ slint::slint! {
                 spacing: 10px;
 
                 ScrollView {
-                    height: (root.height) - 330px;
+                    height: (root.height) - 335px;
                     content-height: root.queues.length * 34px;
                     VerticalLayout {
                         spacing: 2px;
                         alignment: LayoutAlignment.start;
                         for t[i] in root.queues : queueRow {
-                            width: (root.width) - 52px;
                             height: 32px;
                             data: t;
                             index: i;
                             selected: root.selected == i;
-                            select() => { root.selected = i; }
+                            select() => { root.selected = i; fs.focus(); }
                         }
                     }
                 }
 
                 Rectangle {
-                    height: 285px;
+                    height: 290px;
                     background: Palette.color-scheme == ColorScheme.dark ? #202020 : #e8e8e8;
                     border-radius: 5px;
                     VerticalLayout {
@@ -284,18 +324,18 @@ slint::slint! {
                                 width: 145px;
                                 text <=> root.queue-name;
                                 placeholder-text: "queue name";
-                                edited(t) => { root.name-edited(root.selected, t); }
+                                edited(t) => { root.edit-text(root.selected, Field.name, t); }
                             }
                             LineEdit {
                                 width: 75px;
                                 text <=> root.queue;
                                 placeholder-text: "Queue ID";
-                                edited(t) => { root.queue-edited(root.selected, t); }
+                                edited(t) => { root.edit-text(root.selected, Field.queue, t); }
                             }
                             LineEdit {
                                 text <=> root.path;
                                 placeholder-text: "Audio file";
-                                accepted(t) => { root.path-edited(root.selected, t); }
+                                edited(t) => { root.edit-text(root.selected, Field.path, t); }
                             }
                             Button {
                                 text: "Browse...";
@@ -310,36 +350,34 @@ slint::slint! {
                                 width: 90px;
                                 text <=> root.delay-txt;
                                 input-type: InputType.decimal;
-                                accepted(t) => {
-                                    root.delay-txt = t;
-                                    root.delay-edited(root.selected, Math.max(0, t.to-float()));
-                                }
+                                edited(t) => { root.edit-num(root.selected, Field.delay, t.to-float()); }
                             }
                             CheckBox {
                                 text: "Fade queue";
                                 checked: root.fade-queue;
                                 toggled => {
                                     root.fade-queue = self.checked;
-                                    root.fade-queue-edited(root.selected, self.checked);
+                                    root.edit-bool(root.selected, Field.fade-queue, self.checked);
                                 }
                             }
                             LineEdit {
-                                width: 100px;
+                                width: 120px;
                                 text <=> root.fade-target;
                                 enabled: root.fade-queue;
                                 placeholder-text: "Target queue ID";
-                                edited(t) => { root.fade-target-edited(root.selected, t); }
+                                edited(t) => { root.edit-text(root.selected, Field.fade-target, t); }
                             }
-                            Text { text: "Fade duration (s)"; vertical-alignment: center; }
+                            Text {
+                                text: "Fade duration (s)";
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
                             LineEdit {
                                 width: 75px;
                                 text <=> root.fade-duration-txt;
                                 enabled: root.fade-queue;
                                 input-type: InputType.decimal;
-                                accepted(t) => {
-                                    root.fade-duration-txt = t;
-                                    root.fade-duration-edited(root.selected, Math.max(0, t.to-float()));
-                                }
+                                edited(t) => { root.edit-num(root.selected, Field.fade-duration, t.to-float()); }
                             }
                         }
 
@@ -347,21 +385,29 @@ slint::slint! {
                             spacing: 8px;
                             Text { text: "Gain"; width: 55px; vertical-alignment: center; }
                             Slider {
-                                minimum: -60;
+                                minimum: -80;
                                 maximum: 60;
-                                value <=> root.gain;
-                                changed(g) => { root.gain-changed(root.selected, g); }
+                                value <=> root.level;
+                                changed(l) => {
+                                    root.level-txt = "" + Math.round(l);
+                                    root.edit-num(root.selected, root.fade-queue ? Field.fade-level : Field.gain, l);
+                                }
                             }
                             LineEdit {
                                 width: 60px;
-                                text <=> root.gain-txt;
+                                text <=> root.level-txt;
                                 input-type: InputType.decimal;
-                                accepted(t) => {
-                                    root.gain = Math.clamp(t.to-float(), -60, 60);
-                                    root.gain-changed(root.selected, root.gain);
+                                edited(t) => {
+                                    root.level = Math.clamp(t.to-float(), -80, 60);
+                                    root.edit-num(root.selected, root.fade-queue ? Field.fade-level : Field.gain, root.level);
                                 }
                             }
-                            Text { text: root.gain.round() + " dB"; width: 50px; horizontal-alignment: right; vertical-alignment: center; }
+                            Text {
+                                text: root.level <= -80 ? "mute" : root.level.round() + " dB";
+                                width: 50px;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
                         }
 
                         HorizontalLayout {
@@ -369,7 +415,7 @@ slint::slint! {
                             Button { text: "+ Add queue"; clicked => { root.add-queue(); } }
                             Button { text: "Delete queue"; clicked => { root.delete-queue(root.selected); } }
                             Button {
-                                text: root.fade-queue ? "Run fade queue" : "Play queue";
+                                text: "Play queue";
                                 clicked => {
                                     if (root.fade-queue) { root.fade(root.selected); }
                                     else { root.start(root.selected); }
@@ -472,13 +518,13 @@ slint::slint! {
                         Param { idx: 15; label: "Low shelf gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
                         Param { idx: 16; label: "Bell 1 freq"; lo: 20; hi: 18000; initial: 1000; unit: " Hz"; }
                         Param { idx: 17; label: "Bell 1 Q"; lo: 0.1; hi: 10; initial: 1; optional: false; }
-                        Param { idx: 18; label: "Bell 1 gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
+                        Param { idx: 18; label: "Bell 1 gain"; lo: -24; hi: 24; initial: 0; optional: false; }
                         Param { idx: 22; label: "Bell 2 freq"; lo: 20; hi: 18000; initial: 3000; unit: " Hz"; }
                         Param { idx: 23; label: "Bell 2 Q"; lo: 0.1; hi: 10; initial: 1; optional: false; }
-                        Param { idx: 24; label: "Bell 2 gain"; lo: 0.1; hi: 10; initial: 1; optional: false; }
+                        Param { idx: 24; label: "Bell 2 gain"; lo: -24; hi: 24; initial: 0; optional: false; }
                         Param { idx: 19; label: "High shelf freq"; lo: 20; hi: 18000; initial: 8000; unit: " Hz"; }
                         Param { idx: 20; label: "High shelf Q"; lo: 0.1; hi: 10; initial: 0.707; optional: false; }
-                        Param { idx: 21; label: "High shelf gain"; lo: -24; hi: 24; initial: 0; unit: " dB"; optional: false; }
+                        Param { idx: 21; label: "High shelf gain"; lo: -24; hi: 24; initial: 0; optional: false; }
                     }
                 }
             }
@@ -512,11 +558,8 @@ impl Queue {
                     None
                 };
 
-                if let Some(updated) = updated
-                    && let Ok(slot) = session.lock()
-                    && let Some(args) = slot.as_ref()
-                {
-                    args.update_filters(&updated);
+                if let Some(updated) = updated {
+                    with_session(&session, |args| args.update_filters(&updated));
                 }
             }
         });
@@ -527,6 +570,28 @@ impl Queue {
             filter_ui,
         })
     }
+}
+
+fn with_session(session: &Mutex<Option<Args>>, f: impl FnOnce(&Args)) {
+    if let Ok(slot) = session.lock()
+        && let Some(args) = slot.as_ref()
+    {
+        f(args);
+    }
+}
+
+fn stop_session(session: &Mutex<Option<Args>>) {
+    if let Ok(mut slot) = session.lock()
+        && let Some(args) = slot.take()
+    {
+        args.stop();
+    }
+}
+
+fn set_error(weak: &slint::Weak<MainWindow>, idx: usize, msg: String) {
+    let _ = weak.upgrade_in_event_loop(move |ui| {
+        edit_row(&ui.get_queues(), idx, |d| d.error = msg.into());
+    });
 }
 
 fn audio_secs(path: &str) -> anyhow::Result<f32> {
@@ -598,6 +663,7 @@ fn add_queue(
         fade_queue: false,
         fade_target: SharedString::new(),
         fade_duration: 1.0,
+        fade_level: MUTE_DB,
         length: 0.0,
     });
     Ok(())
@@ -639,52 +705,56 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    main_ui.on_name_edited({
+    main_ui.on_edit_text({
         let model = model.clone();
         let queues = queues.clone();
-        move |idx, name| {
-            let idx = idx as usize;
-            edit_row(&*model, idx, |d| d.name = name.clone());
-            if let Some(queue) = queues.borrow().get(idx) {
-                queue.filter_ui.set_queue_name(name);
+        let weak = main_ui.as_weak();
+        move |idx, field, text| {
+            let i = idx as usize;
+            match field {
+                Field::Name => {
+                    edit_row(&*model, i, |d| d.name = text.clone());
+                    if let Some(queue) = queues.borrow().get(i) {
+                        queue.filter_ui.set_queue_name(text);
+                    }
+                }
+                Field::Queue => edit_row(&*model, i, |d| d.queue = text),
+                Field::FadeTarget => edit_row(&*model, i, |d| d.fade_target = text),
+                Field::Path => {
+                    edit_row(&*model, i, |d| set_path(d, text.clone()));
+                    load_audio_length(weak.clone(), i, text.to_string());
+                }
+                _ => {}
             }
         }
     });
 
-    main_ui.on_queue_edited({
+    main_ui.on_edit_num({
         let model = model.clone();
-        move |idx, queue| {
-            edit_row(&*model, idx as usize, |d| d.queue = queue);
+        let queues = queues.clone();
+        move |idx, field, v| {
+            let i = idx as usize;
+            match field {
+                Field::Delay => edit_row(&*model, i, |d| d.delay = v.max(0.0)),
+                Field::FadeDuration => edit_row(&*model, i, |d| d.fade_duration = v.max(0.0)),
+                Field::FadeLevel => edit_row(&*model, i, |d| d.fade_level = v.clamp(MUTE_DB, 60.0)),
+                Field::Gain => {
+                    edit_row(&*model, i, |d| d.gain = v);
+                    if let Some(t) = queues.borrow().get(i) {
+                        with_session(&t.session, |args| args.set_gain_db(v));
+                    }
+                }
+                _ => {}
+            }
         }
     });
 
-    main_ui.on_delay_edited({
+    main_ui.on_edit_bool({
         let model = model.clone();
-        move |idx, delay| {
-            edit_row(&*model, idx as usize, |d| d.delay = delay.max(0.0));
-        }
-    });
-
-    main_ui.on_fade_queue_edited({
-        let model = model.clone();
-        move |idx, enabled| {
-            edit_row(&*model, idx as usize, |d| d.fade_queue = enabled);
-        }
-    });
-
-    main_ui.on_fade_target_edited({
-        let model = model.clone();
-        move |idx, target| {
-            edit_row(&*model, idx as usize, |d| d.fade_target = target);
-        }
-    });
-
-    main_ui.on_fade_duration_edited({
-        let model = model.clone();
-        move |idx, duration| {
-            edit_row(&*model, idx as usize, |d| {
-                d.fade_duration = duration.max(0.0)
-            });
+        move |idx, field, v| {
+            if let Field::FadeQueue = field {
+                edit_row(&*model, idx as usize, |d| d.fade_queue = v);
+            }
         }
     });
 
@@ -702,11 +772,7 @@ fn main() -> Result<(), slint::PlatformError> {
             playback_generation.fetch_add(1, Ordering::SeqCst);
 
             let removed = queues.borrow_mut().remove(idx);
-            if let Ok(mut slot) = removed.session.lock() {
-                if let Some(args) = slot.take() {
-                    args.stop();
-                }
-            }
+            stop_session(&removed.session);
             let _ = removed.filter_ui.hide();
             model.remove(idx);
 
@@ -720,30 +786,6 @@ fn main() -> Result<(), slint::PlatformError> {
                     selected
                 };
                 ui.set_selected(next as i32);
-            }
-        }
-    });
-
-    main_ui.on_path_edited({
-        let model = model.clone();
-        let weak = main_ui.as_weak();
-        move |idx, path| {
-            let idx = idx as usize;
-            edit_row(&*model, idx, |d| set_path(d, path.clone()));
-            load_audio_length(weak.clone(), idx, path.to_string());
-        }
-    });
-
-    main_ui.on_gain_changed({
-        let model = model.clone();
-        let queues = queues.clone();
-        move |idx, gain| {
-            edit_row(&*model, idx as usize, |d| d.gain = gain);
-            if let Some(t) = queues.borrow().get(idx as usize)
-                && let Ok(slot) = t.session.lock()
-                && let Some(args) = slot.as_ref()
-            {
-                args.set_gain_db(gain);
             }
         }
     });
@@ -779,11 +821,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 .collect();
 
             for existing in sessions {
-                if let Ok(mut slot) = existing.lock() {
-                    if let Some(args) = slot.take() {
-                        args.stop();
-                    }
-                }
+                stop_session(&existing);
             }
 
             let purged: Vec<Args> = fading
@@ -830,15 +868,10 @@ fn main() -> Result<(), slint::PlatformError> {
                     return;
                 }
 
-                let _ = weak.upgrade_in_event_loop(move |ui| {
-                    edit_row(&ui.get_queues(), idx, |d| d.error = "".into());
-                });
+                set_error(&weak, idx, String::new());
 
                 if let Err(e) = run(&thread_args) {
-                    let msg = format!("ERROR: {e:#}");
-                    let _ = weak.upgrade_in_event_loop(move |ui| {
-                        edit_row(&ui.get_queues(), idx, |d| d.error = msg.into());
-                    });
+                    set_error(&weak, idx, format!("ERROR: {e:#}"));
                 }
             });
         }
@@ -877,12 +910,13 @@ fn main() -> Result<(), slint::PlatformError> {
 
             let delay = Duration::from_secs_f32(queue.delay.max(0.0));
             let duration = Duration::from_secs_f32(queue.fade_duration.max(0.0));
+            let level = queue.fade_level;
 
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
                 let args = session.lock().ok().and_then(|slot| slot.clone());
                 if let Some(args) = args {
-                    args.fade_to(0.0, duration);
+                    args.fade_to_db(level, duration);
                 }
             });
         }
@@ -914,7 +948,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
                     let fading = fading.clone();
                     std::thread::spawn(move || {
-                        args.fade_to(0.0, Duration::from_secs(1));
+                        args.fade_to_db(MUTE_DB, Duration::from_secs(1));
                         args.stop();
                         if let Ok(mut f) = fading.lock() {
                             f.retain(|(i, _)| *i != id);

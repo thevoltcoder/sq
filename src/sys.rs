@@ -13,6 +13,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
+    thread::JoinHandle,
     time::Duration,
 };
 use symphonia::core::{
@@ -29,6 +30,31 @@ const WINDOW_DIV: usize = 100;
 const DC_BLOCK_HZ: f32 = 20.0;
 const QUEUE_DEPTH: usize = 8;
 const SAFETY_CEILING: f32 = 0.98;
+
+pub const MUTE_DB: f32 = -80.0;
+const FADE_FLOOR: f32 = 1e-4;
+
+fn db_to_lin(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+fn lin_to_db(lin: f32) -> f32 {
+    20.0 * lin.log10()
+}
+
+fn load_f32(atom: &AtomicU32) -> f32 {
+    f32::from_bits(atom.load(Ordering::Relaxed))
+}
+
+fn store_f32(atom: &AtomicU32, value: f32) {
+    atom.store(value.to_bits(), Ordering::Relaxed);
+}
+
+fn join_decoder(handle: JoinHandle<anyhow::Result<()>>) -> anyhow::Result<()> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("decoder thread panicked"))?
+}
 
 #[derive(Clone, Debug)]
 pub struct Args {
@@ -64,7 +90,7 @@ impl Default for Args {
             gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             stop_queued: Arc::new(AtomicBool::new(false)),
             live_filters: Arc::new(RwLock::new(FilterSettings::default())),
-            live_ceiling: Arc::new(AtomicU32::new(10.0_f32.powf(-12.0 / 20.0).to_bits())),
+            live_ceiling: Arc::new(AtomicU32::new(db_to_lin(-12.0).to_bits())),
         }
     }
 }
@@ -81,40 +107,39 @@ impl Args {
                 comp: source.comp,
                 ceiling: source.ceiling,
             };
-            self.live_ceiling.store(
-                10.0_f32.powf(source.ceiling / 20.0).to_bits(),
-                Ordering::Relaxed,
-            );
+            store_f32(&self.live_ceiling, db_to_lin(source.ceiling));
         }
     }
 
     pub fn set_gain_db(&self, db: f32) {
-        let lin = 10f32.powf(db / 20.0);
-        let lin = if lin.is_finite() { lin } else { 1.0 };
-        self.gain.store(lin.to_bits(), Ordering::Relaxed);
+        let lin = db_to_lin(db);
+        store_f32(&self.gain, if lin.is_finite() { lin } else { 1.0 });
     }
 
     pub fn set_volume(&self, gain: f32) {
-        self.volume.store(gain.to_bits(), Ordering::Relaxed);
+        store_f32(&self.volume, gain);
     }
 
     pub fn set_volume_db(&self, db: f32) {
-        self.set_volume(10f32.powf(db / 20.0));
+        self.set_volume(db_to_lin(db));
     }
 
     pub fn fade_to(&self, target: f32, dur: Duration) {
-        const FLOOR: f32 = 1e-4;
-        let start = f32::from_bits(self.volume.load(Ordering::Relaxed));
-        let start_db = 20.0 * start.max(FLOOR).log10();
-        let target_db = 20.0 * target.max(FLOOR).log10();
+        let start = load_f32(&self.volume);
+        let start_db = lin_to_db(start.max(FADE_FLOOR));
+        let target_db = lin_to_db(target.max(FADE_FLOOR));
         let steps = (dur.as_secs_f32() * 100.0).max(1.0) as u32;
         for i in 1..=steps {
             let t = i as f32 / steps as f32;
-            let db = start_db + (target_db - start_db) * t;
-            self.set_volume(10f32.powf(db / 20.0));
+            self.set_volume_db(start_db + (target_db - start_db) * t);
             std::thread::sleep(Duration::from_millis(10));
         }
         self.set_volume(target);
+    }
+
+    pub fn fade_to_db(&self, db: f32, dur: Duration) {
+        let target = if db <= MUTE_DB { 0.0 } else { db_to_lin(db) };
+        self.fade_to(target, dur);
     }
 
     pub fn stop(&self) {
@@ -228,7 +253,7 @@ fn build_chain(args: &FilterSettings, rate: f64) -> Vec<Box<dyn AudioUnit>> {
     chain.push(Box::new(highpass_hz(DC_BLOCK_HZ, 0.707)));
 
     if let Some(db) = args.preamp.filter(|d| d.abs() > 1e-3) {
-        chain.push(Box::new(pass() * db_amp(db)));
+        chain.push(Box::new(pass() * db_to_lin(db)));
     }
 
     if let Some(hz) = args.hpf {
@@ -236,8 +261,8 @@ fn build_chain(args: &FilterSettings, rate: f64) -> Vec<Box<dyn AudioUnit>> {
     }
 
     if let Some(gate) = args.gate {
-        let thresh_amp = db_amp(gate.thresh);
-        let floor_gain = db_amp(gate.depth);
+        let thresh_amp = db_to_lin(gate.thresh);
+        let floor_gain = db_to_lin(gate.depth);
         let attack_s = gate.att / 1000.0;
         let release_s = gate.rel / 1000.0;
 
@@ -260,7 +285,7 @@ fn build_chain(args: &FilterSettings, rate: f64) -> Vec<Box<dyn AudioUnit>> {
     }
 
     for b in &args.eq {
-        let gain = 10f32.powf(b.gain / 20.0);
+        let gain = db_to_lin(b.gain);
         let unit: Box<dyn AudioUnit> = match b.kind {
             EqKind::Bell => Box::new(bell_hz(b.hz, b.q, gain)),
             EqKind::LowShelf => Box::new(lowshelf_hz(b.hz, b.q, gain)),
@@ -271,15 +296,15 @@ fn build_chain(args: &FilterSettings, rate: f64) -> Vec<Box<dyn AudioUnit>> {
 
     if let Some(c) = args.comp {
         let slope = 1.0 - 1.0 / c.ratio;
-        let makeup = 10f32.powf(c.makeup / 20.0);
+        let makeup = db_to_lin(c.makeup);
         chain.push(Box::new(
             (pass()
                 ^ (map(|i: &Frame<f32, U1>| i[0].abs())
                     >> afollow(c.att * 0.001, c.rel * 0.001)
                     >> map(move |i: &Frame<f32, U1>| {
-                        let over = 20.0 * i[0].max(1e-9).log10() - c.thresh;
+                        let over = lin_to_db(i[0].max(1e-9)) - c.thresh;
                         if over > 0.0 {
-                            10f32.powf(-over * slope / 20.0) * makeup
+                            db_to_lin(-over * slope) * makeup
                         } else {
                             makeup
                         }
@@ -508,9 +533,9 @@ impl Pipeline {
             .map_err(|_| anyhow::anyhow!("live filter settings lock poisoned"))?
             .clone();
         check_nyquist(&settings, rate)?;
-        let ceiling = 10f32.powf(settings.ceiling / 20.0);
+        let ceiling = db_to_lin(settings.ceiling);
         let gain = Arc::clone(&args.gain);
-        let last_gain = f32::from_bits(gain.load(Ordering::Relaxed));
+        let last_gain = load_f32(&gain);
         Ok(Self {
             channels,
             rate,
@@ -539,7 +564,7 @@ impl Pipeline {
             return Ok(None);
         }
         check_nyquist(&settings, self.rate)?;
-        self.ceiling = 10f32.powf(settings.ceiling / 20.0);
+        self.ceiling = db_to_lin(settings.ceiling);
         self.limiter.ceiling = self.ceiling;
 
         let mut old = None;
@@ -558,7 +583,7 @@ impl Pipeline {
     }
 
     fn apply_gain(&mut self, chunk: &mut [f32]) {
-        let raw = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        let raw = load_f32(&self.gain);
         let target = if raw.is_finite() { raw } else { 1.0 };
         let start = self.last_gain;
         self.last_gain = target;
@@ -783,7 +808,7 @@ impl Player {
         channels: usize,
         initial: Vec<f32>,
     ) -> Self {
-        let last_vol = f32::from_bits(volume.load(Ordering::Relaxed));
+        let last_vol = load_f32(&volume);
         Self {
             rx,
             shared,
@@ -796,7 +821,7 @@ impl Player {
     }
 
     fn fill(&mut self, data: &mut [f32]) {
-        let target = f32::from_bits(self.volume.load(Ordering::Relaxed));
+        let target = load_f32(&self.volume);
         let start = self.last_vol;
         let total_frames = std::cmp::Ord::max(data.len() / self.channels, 1);
         let step = (target - start) / total_frames as f32;
@@ -869,9 +894,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     let (file_rate, channels) = match spec_rx.recv() {
         Ok(spec) => spec,
         Err(_) => {
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("decoder thread panicked"))??;
+            join_decoder(handle)?;
             bail!("no audio decoded");
         }
     };
@@ -882,11 +905,10 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
 
     let initial = match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(chunk) => chunk,
-        Err(error) => match handle.join() {
-            Ok(Ok(())) => return Err(error).context("audio decoder did not produce audio"),
-            Ok(Err(error)) => return Err(error),
-            Err(_) => bail!("decoder thread panicked"),
-        },
+        Err(error) => {
+            join_decoder(handle)?;
+            return Err(error).context("audio decoder did not produce audio");
+        }
     };
 
     let err_shared = Arc::clone(&shared);
@@ -924,7 +946,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
 
             drop(stream);
             if let Some(h) = handle.take() {
-                let _ = h.join();
+                let _ = join_decoder(h);
             }
             bail!("audio output device reported an error; playback stopped");
         }
@@ -932,24 +954,16 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
         if shared.stop.load(Ordering::Relaxed) {
             drop(stream);
             if let Some(h) = handle.take() {
-                let _ = h.join();
+                let _ = join_decoder(h);
             }
             return Ok(());
         }
 
         if handle.as_ref().is_some_and(|h| h.is_finished()) {
-            match handle.take().unwrap().join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    shared.stop.store(true, Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(120));
-                    return Err(e);
-                }
-                Err(_) => {
-                    shared.stop.store(true, Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(120));
-                    bail!("decoder thread panicked");
-                }
+            if let Err(e) = join_decoder(handle.take().unwrap()) {
+                shared.stop.store(true, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(120));
+                return Err(e);
             }
         }
         std::io::stdout().flush().ok();
@@ -962,8 +976,7 @@ pub fn run(args: &Args) -> anyhow::Result<()> {
     println!();
 
     if let Some(h) = handle {
-        h.join()
-            .map_err(|_| anyhow::anyhow!("decoder thread panicked"))??;
+        join_decoder(h)?;
     }
 
     std::thread::sleep(Duration::from_millis(300));
